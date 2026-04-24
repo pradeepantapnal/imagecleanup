@@ -21,6 +21,8 @@ Optional:
   --dry-run           Score distribution preview, no files written
   --vision-limit N    Max images to vision LLM (default: 20)
   --vision-model M    Primary Ollama model (default: llava)
+  --metrics-excel X   Use external metrics workbook
+  --generate-metrics  Generate metrics workbook and exit
   --output-dir DIR    Output directory (default: output)
   --clear-cache       Wipe cache before running
 """
@@ -421,12 +423,94 @@ def parse_json(raw: str) -> dict:
     raise ValueError(f"Cannot parse JSON: {raw[:100]}")
 
 
-def cache_key(folder: str) -> str:
-    return hashlib.md5(folder.encode()).hexdigest()[:12]
+def cache_key(folder: str, metrics_excel: Optional[str] = None) -> str:
+    folder_abs = str(Path(folder).resolve())
+    metrics_abs = str(Path(metrics_excel).resolve()) if metrics_excel else "inline_metrics"
+    return hashlib.md5(f"{folder_abs}|{metrics_abs}".encode()).hexdigest()[:12]
+
+
+def _to_float(val, default: float = 0.0) -> float:
+    try:
+        if val is None or val == "":
+            return default
+        return float(val)
+    except Exception:
+        return default
+
+
+def _to_int(val, default: int = 0) -> int:
+    try:
+        if val is None or val == "":
+            return default
+        return int(val)
+    except Exception:
+        return default
+
+
+def _norm_path(s: str) -> str:
+    return str(s).strip().replace("\\", "/").lower()
+
+
+def load_metrics_excel(path: str) -> Dict[str, dict]:
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = wb.active
+    rows = ws.iter_rows(min_row=1, max_row=1, values_only=True)
+    header_row = next(rows, None) or []
+    headers = {str(h).strip().lower(): idx for idx, h in enumerate(header_row) if h is not None}
+
+    by_path: Dict[str, dict] = {}
+    by_filename: Dict[str, dict] = {}
+
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row:
+            continue
+        path_val = row[headers["path"]] if "path" in headers else None
+        file_val = row[headers["filename"]] if "filename" in headers else None
+        if path_val is None and file_val is None:
+            continue
+
+        data = {
+            "blur": _to_float(row[headers["blur"]], 0.0) if "blur" in headers else 0.0,
+            "brisque": _to_float(row[headers["brisque"]], 0.0) if "brisque" in headers else 0.0,
+            "composite_score": _to_float(row[headers["composite_score"]], 0.0) if "composite_score" in headers else 0.0,
+            "label": str(row[headers["label"]]).strip().upper() if "label" in headers and row[headers["label"]] is not None else "",
+            "resolution": _to_float(row[headers["resolution"]], 0.0) if "resolution" in headers else 0.0,
+            "width": _to_int(row[headers["width"]], 0) if "width" in headers else 0,
+            "height": _to_int(row[headers["height"]], 0) if "height" in headers else 0,
+            "colorfulness": _to_float(row[headers["colorfulness"]], 0.0) if "colorfulness" in headers else 0.0,
+            "brightness": _to_float(row[headers["brightness"]], 0.0) if "brightness" in headers else 0.0,
+            "contrast": _to_float(row[headers["contrast"]], 0.0) if "contrast" in headers else 0.0,
+        }
+
+        if path_val:
+            by_path[_norm_path(str(path_val))] = data
+        if file_val:
+            by_filename[str(file_val).strip().lower()] = data
+
+    return {"by_path": by_path, "by_filename": by_filename}
 
 
 # ── Stage 1: Load & compute all metrics inline ────────────────────────────────
-def stage_load(images: List[Path], db: DB, ck: str) -> List[Photo]:
+def _match_metrics_row(img: Path, folder: str, metrics: Dict[str, dict]) -> Optional[dict]:
+    by_path = metrics.get("by_path", {})
+    by_filename = metrics.get("by_filename", {})
+
+    abs_key = _norm_path(str(img))
+    if abs_key in by_path:
+        return by_path[abs_key]
+
+    try:
+        rel_key = _norm_path(str(img.relative_to(Path(folder))))
+        if rel_key in by_path:
+            return by_path[rel_key]
+    except Exception:
+        pass
+
+    return by_filename.get(img.name.lower())
+
+
+def stage_load(images: List[Path], db: DB, ck: str,
+               folder: str, metrics: Optional[Dict[str, dict]] = None) -> List[Photo]:
     log.info(f"S1 load+metrics: {len(images)} images")
     photos = []
     for img in tqdm(images, desc="S1 metrics"):
@@ -455,6 +539,26 @@ def stage_load(images: List[Path], db: DB, ck: str) -> List[Photo]:
             p.blur, p.brisque, p.resolution, p.colorfulness, p.contrast
         )
         p.composite_score = round(p.composite_score, 2)
+
+        if metrics:
+            m = _match_metrics_row(img, folder, metrics)
+            if m:
+                p.blur = round(m.get("blur", p.blur), 2)
+                p.brisque = round(m.get("brisque", p.brisque), 2)
+                p.composite_score = round(m.get("composite_score", p.composite_score), 2)
+                p.label = m.get("label") or p.label
+                if m.get("resolution", 0) > 0:
+                    p.resolution = m.get("resolution", p.resolution)
+                if m.get("width", 0) > 0:
+                    p.width = m.get("width", p.width)
+                if m.get("height", 0) > 0:
+                    p.height = m.get("height", p.height)
+                if m.get("colorfulness", 0) > 0:
+                    p.colorfulness = m.get("colorfulness", p.colorfulness)
+                if m.get("brightness", 0) > 0:
+                    p.brightness = m.get("brightness", p.brightness)
+                if m.get("contrast", 0) > 0:
+                    p.contrast = m.get("contrast", p.contrast)
 
         photos.append(p)
         db.save(p)
@@ -914,11 +1018,10 @@ def write_excel(photos: List[Photo], path: str):
     ws.row_dimensions[1].height = 28
     ws.freeze_panes = "A2"
 
-    # Sort: REMOVE first (lowest score), then REVIEW, then KEEP
-    order = {"REMOVE": 0, "REVIEW": 1, "KEEP": 2}
+    # Sort strictly by score ascending (worst first)
     sorted_photos = sorted(
         [p for p in photos if p.file_exists],
-        key=lambda p: (order.get(p.decision, 3), p.score)
+        key=lambda p: (p.score, p.filename.lower())
     )
 
     alt_fill = [
@@ -993,6 +1096,30 @@ def write_csv(photos: List[Photo], path: str):
     log.info(f"CSV          : {len(rows)} rows")
 
 
+def write_metrics_excel(photos: List[Photo], path: str, folder: str):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Metrics"
+    headers = [
+        "path", "filename", "blur", "brisque", "composite_score", "label",
+        "resolution", "width", "height", "colorfulness", "brightness", "contrast"
+    ]
+    ws.append(headers)
+    root = Path(folder)
+    for p in photos:
+        full = Path(p.path)
+        try:
+            rel = str(full.relative_to(root)).replace("/", "\\")
+        except Exception:
+            rel = p.path
+        ws.append([
+            rel, p.filename, p.blur, p.brisque, p.composite_score, p.label,
+            p.resolution, p.width, p.height, p.colorfulness, p.brightness, p.contrast
+        ])
+    wb.save(path)
+    log.info(f"Metrics XLSX : {len(photos)} rows -> {path}")
+
+
 # ── Dry run ────────────────────────────────────────────────────────────────────
 def print_dry_run(photos: List[Photo]):
     buckets = {"0-20": 0, "21-35": 0, "36-50": 0, "51-65": 0, "66-80": 0, "81-100": 0}
@@ -1036,6 +1163,10 @@ def main():
                         help="Fallback vision model")
     parser.add_argument("--vision-limit", type=int, default=20,
                         help="Max images to send to vision LLM (default: 20)")
+    parser.add_argument("--metrics-excel", default=None,
+                        help="Path to metrics Excel file (optional)")
+    parser.add_argument("--generate-metrics", action="store_true",
+                        help="Generate metrics Excel from folder scan and exit")
     parser.add_argument("--dry-run", action="store_true",
                         help="Preview score distribution, write no files")
     parser.add_argument("--clear-cache", action="store_true",
@@ -1054,11 +1185,19 @@ def main():
         log.info("Cache        : cleared")
 
     start = datetime.now()
-    ck = cache_key(args.folder)
+    ck = cache_key(args.folder, args.metrics_excel)
 
     log.info(f"Photo Cleanup Engine v{VERSION}")
     log.info(f"Folder       : {args.folder}")
     log.info(f"Config       : limit={args.limit or 'all'} vision={args.enable_vision} faces={args.enable_faces}")
+
+    metrics = None
+    if args.metrics_excel:
+        mpath = Path(args.metrics_excel)
+        if not mpath.exists():
+            raise FileNotFoundError(f"--metrics-excel not found: {args.metrics_excel}")
+        metrics = load_metrics_excel(str(mpath))
+        log.info(f"Metrics      : loaded from {args.metrics_excel}")
 
     db = DB(str(out_dir / "cache.db"))
 
@@ -1066,7 +1205,14 @@ def main():
         images = find_images(args.folder, args.limit)
         log.info(f"Found        : {len(images)} images")
 
-        photos = stage_load(images, db, ck)
+        photos = stage_load(images, db, ck, args.folder, metrics)
+
+        if args.generate_metrics:
+            metrics_name = f"{Path(args.folder).name}_metrics.xlsx"
+            write_metrics_excel(photos, str(out_dir / metrics_name), args.folder)
+            log.info("Done         : metrics generated")
+            return
+
         photos = stage_duplicates(photos, db)
         photos = stage_burst(photos, db)
         photos = stage_clip(photos, db)
