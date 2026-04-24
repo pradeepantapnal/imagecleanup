@@ -1,0 +1,23 @@
+{
+  "metrics_excel": "sample_metrics.xlsx",
+  "output_dir": "output",
+  "duplicate_threshold": 8,
+  "event_gap_hours": 6,
+  "limit": 10,
+  "v2_features": {
+    "enable_faces": false,
+    "enable_vision": true,
+    "enable_search": false,
+    "vision_model": "llama3.2-vision",
+    "vision_fallback": "llava",
+    "vision_max_images": 3
+  },
+  "processing": {
+    "checkpoint_interval": 10,
+    "blur_threshold": 80.0
+  },
+  "models": {
+    "ollama_url": "http://localhost:11434/api/generate",
+    "vision_timeout": 120
+  }
+}
