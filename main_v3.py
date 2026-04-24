@@ -39,9 +39,11 @@ import sqlite3
 import argparse
 import logging
 import requests
+from time import perf_counter
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime
+from contextlib import contextmanager
 from collections import defaultdict, Counter
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
@@ -198,13 +200,17 @@ class DB:
 # ── Logging ────────────────────────────────────────────────────────────────────
 def setup_log(output_dir: str) -> logging.Logger:
     log_path = Path(output_dir) / "engine.log"
-    fmt = "%(asctime)s %(levelname)s %(message)s"
+    fmt = "%(asctime)s.%(msecs)03d %(levelname)s [%(name)s] %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S%z"
     logging.basicConfig(level=logging.INFO, format=fmt, handlers=[
         logging.FileHandler(log_path, encoding="utf-8"),
     ])
     console = logging.StreamHandler(sys.stdout)
     console.setLevel(logging.INFO)
-    console.setFormatter(logging.Formatter(fmt))
+    console.setFormatter(logging.Formatter(fmt=fmt, datefmt=datefmt))
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, logging.FileHandler):
+            handler.setFormatter(logging.Formatter(fmt=fmt, datefmt=datefmt))
     try:
         sys.stdout.reconfigure(encoding='utf-8')
     except Exception:
@@ -213,6 +219,22 @@ def setup_log(output_dir: str) -> logging.Logger:
     return logging.getLogger("photo")
 
 log = logging.getLogger("photo")
+
+
+@contextmanager
+def stage_timer(label: str):
+    started_at = datetime.now().astimezone()
+    tick = perf_counter()
+    log.info(f"[START] {label} @ {started_at.isoformat(timespec='milliseconds')}")
+    try:
+        yield
+    finally:
+        finished_at = datetime.now().astimezone()
+        elapsed = perf_counter() - tick
+        log.info(
+            f"[END]   {label} @ {finished_at.isoformat(timespec='milliseconds')} "
+            f"(elapsed={elapsed:.2f}s)"
+        )
 
 
 # ── Image metrics ──────────────────────────────────────────────────────────────
@@ -1202,37 +1224,50 @@ def main():
     db = DB(str(out_dir / "cache.db"))
 
     try:
-        images = find_images(args.folder, args.limit)
+        with stage_timer("Scan images"):
+            images = find_images(args.folder, args.limit)
         log.info(f"Found        : {len(images)} images")
 
-        photos = stage_load(images, db, ck, args.folder, metrics)
+        with stage_timer("S1 load+metrics"):
+            photos = stage_load(images, db, ck, args.folder, metrics)
 
         if args.generate_metrics:
             metrics_name = f"{Path(args.folder).name}_metrics.xlsx"
-            write_metrics_excel(photos, str(out_dir / metrics_name), args.folder)
+            with stage_timer("Write metrics workbook"):
+                write_metrics_excel(photos, str(out_dir / metrics_name), args.folder)
             log.info("Done         : metrics generated")
             return
 
-        photos = stage_duplicates(photos, db)
-        photos = stage_burst(photos, db)
-        photos = stage_clip(photos, db)
-        photos = stage_events(photos, db)
+        with stage_timer("S2 duplicates"):
+            photos = stage_duplicates(photos, db)
+        with stage_timer("S3 burst detection"):
+            photos = stage_burst(photos, db)
+        with stage_timer("S4 CLIP tagging"):
+            photos = stage_clip(photos, db)
+        with stage_timer("S5 event grouping"):
+            photos = stage_events(photos, db)
         if args.enable_faces:
-            photos = stage_faces(photos, db)
+            with stage_timer("S6 face detection"):
+                photos = stage_faces(photos, db)
 
         # Initial scoring before vision
-        photos = compute_scores(photos)
+        with stage_timer("Compute scores"):
+            photos = compute_scores(photos)
 
         if args.enable_vision:
-            photos = stage_vision(photos, db,
-                                  args.vision_model, args.vision_fallback,
-                                  args.vision_limit)
+            with stage_timer("S7 vision analysis"):
+                photos = stage_vision(photos, db,
+                                      args.vision_model, args.vision_fallback,
+                                      args.vision_limit)
 
         if args.dry_run:
-            print_dry_run(photos)
+            with stage_timer("Dry-run summary"):
+                print_dry_run(photos)
         else:
-            write_excel(photos, str(out_dir / "photo_cleanup.xlsx"))
-            write_csv(photos, str(out_dir / "photo_cleanup.csv"))
+            with stage_timer("Write Excel"):
+                write_excel(photos, str(out_dir / "photo_cleanup.xlsx"))
+            with stage_timer("Write CSV"):
+                write_csv(photos, str(out_dir / "photo_cleanup.csv"))
 
         secs = (datetime.now() - start).total_seconds()
         log.info(f"Done         : {len(photos)} photos in {secs:.0f}s")
