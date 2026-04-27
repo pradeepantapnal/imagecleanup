@@ -284,7 +284,12 @@ def compute_brisque_approx(path: Path) -> float:
         else:
             # PIL fallback — cruder estimate from local variance stats
             with Image.open(path) as img:
-                px = list(img.convert("L").resize((256, 256)).getdata())
+                gray = img.convert("L").resize((256, 256))
+                if hasattr(gray, "get_flattened_data"):
+                    px = list(gray.get_flattened_data())
+                else:
+                    # Pillow < 11 fallback
+                    px = list(gray.getdata())
             mean = sum(px) / len(px)
             var = sum((p - mean) ** 2 for p in px) / len(px)
             # Low variance = flat/blurry = high BRISQUE
@@ -302,10 +307,19 @@ def compute_brisque_approx(path: Path) -> float:
 def compute_colorfulness(img: Image.Image) -> float:
     """Hasler & Susstrunk colorfulness metric."""
     try:
-        data = list(img.convert("RGB").resize((256, 256)).getdata())
-        r = [p[0] for p in data]
-        g = [p[1] for p in data]
-        b = [p[2] for p in data]
+        rgb = img.convert("RGB").resize((256, 256))
+        r_band = rgb.getchannel("R")
+        g_band = rgb.getchannel("G")
+        b_band = rgb.getchannel("B")
+        if hasattr(r_band, "get_flattened_data"):
+            r = list(r_band.get_flattened_data())
+            g = list(g_band.get_flattened_data())
+            b = list(b_band.get_flattened_data())
+        else:
+            # Pillow < 11 fallback
+            r = list(r_band.getdata())
+            g = list(g_band.getdata())
+            b = list(b_band.getdata())
         n = len(r)
         rg = [r[i] - g[i] for i in range(n)]
         yb = [0.5 * (r[i] + g[i]) - b[i] for i in range(n)]
@@ -321,7 +335,12 @@ def compute_colorfulness(img: Image.Image) -> float:
 def compute_brightness_contrast(img: Image.Image) -> Tuple[float, float]:
     """Luminance mean (brightness) and std-dev (contrast)."""
     try:
-        px = list(img.convert("L").resize((256, 256)).getdata())
+        gray = img.convert("L").resize((256, 256))
+        if hasattr(gray, "get_flattened_data"):
+            px = list(gray.get_flattened_data())
+        else:
+            # Pillow < 11 fallback
+            px = list(gray.getdata())
         mean = sum(px) / len(px)
         std = math.sqrt(sum((p - mean) ** 2 for p in px) / len(px))
         return mean, std

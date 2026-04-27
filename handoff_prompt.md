@@ -97,33 +97,42 @@ Thresholds:
 
 ## Current state
 
-- Script runs end-to-end on 499 Naples photos (May 2025 trip)
-- 58 burst groups detected
-- Vision working: llava ~16s/image, JSON parsing correct
-- CLIP running on CPU (slow, ~5min for 499 — GPU torch not yet installed)
-- Metrics not yet generated for Naples — sample_metrics.xlsx has dummy data
-- Results without real metrics: KEEP=58, REMOVE=69, REVIEW=372 (expected — no metrics)
+- Script runs end-to-end on Windows and produces both Excel + CSV outputs.
+- Latest validated run (2026-04-27) on 102 images completed in 252s.
+- Duplicate/burst/event stages are working (2 duplicate groups, 1 burst group, 69 event groups in that run).
+- CLIP is running on CUDA in current setup (log shows `S4 CLIP : ... (cuda)`).
+- Vision stage is active and expensive (~13.1s/image; 15 images took ~196s with `--vision-limit 15`).
+- Output distribution in latest run: KEEP=32, REMOVE=24, REVIEW=46.
+- Pillow deprecation warning around `Image.getdata()` has now been addressed in `main_v3.py` using
+  `get_flattened_data()` with a backward-compatible fallback.
 
 ---
 
 ## Immediate next steps
 
-1. Run `--generate-metrics` to produce real blur/composite scores for Naples:
+1. Re-run on a small folder (20-50 photos) and confirm there are no Pillow deprecation warnings:
+   ```
+   python main_v3.py --folder "C:\...\input" --enable-vision --vision-limit 5
+   ```
+
+2. Run `--generate-metrics` to produce real blur/composite scores for Naples:
    ```
    python main_v3.py --folder "C:\...\Naples" --generate-metrics
    ```
 
-2. Run full pipeline with those metrics + vision overnight:
+3. Run full pipeline with those metrics + vision overnight:
    ```
    python main_v3.py --folder "C:\...\Naples" --metrics-excel "output\Naples_metrics.xlsx" --enable-vision --vision-limit 200
    ```
 
-3. Install GPU-accelerated torch so CLIP runs on RTX 2000 Ada instead of CPU:
+4. If runtime is high, tune vision workload first (`--vision-limit`) before touching score thresholds.
+
+5. Install/verify GPU-accelerated torch only if CLIP falls back to CPU again:
    ```
    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
    ```
 
-4. Interpret Excel results: REMOVE first (safe deletes), then sort REVIEW by score
+6. Interpret Excel results: REMOVE first (safe deletes), then sort REVIEW by score
    ascending and work upward.
 
 ---
