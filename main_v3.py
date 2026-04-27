@@ -147,6 +147,7 @@ class Photo:
     caption: str = ""
     vision_category: str = ""
     vision_quality: str = ""
+    vision_memorability: int = 0
     vision_keep: str = ""
     vision_delete: str = ""
     vision_model: str = ""
@@ -273,27 +274,20 @@ def compute_brisque_approx(path: Path) -> float:
             sigma = cv2.GaussianBlur(img * img, (7, 7), 7 / 6)
             sigma = np.sqrt(np.abs(sigma - mu_sq)) + 1e-7
             mscn = (img - mu) / sigma
-            # Fit generalized Gaussian — use shape and variance as proxies
             mscn_flat = mscn.flatten()
             var = float(np.var(mscn_flat))
             kurt = float(np.mean(mscn_flat ** 4) / (var ** 2 + 1e-7)) - 3.0
-            # Natural images: kurtosis ~0-3, variance ~0.5-1.5
-            # Distorted: higher kurtosis, extreme variance
             quality = 20.0 + abs(kurt) * 8.0 + abs(var - 1.0) * 15.0
             return max(0.0, min(100.0, quality))
         else:
-            # PIL fallback — cruder estimate from local variance stats
             with Image.open(path) as img:
                 gray = img.convert("L").resize((256, 256))
                 if hasattr(gray, "get_flattened_data"):
                     px = list(gray.get_flattened_data())
                 else:
-                    # Pillow < 11 fallback
                     px = list(gray.getdata())
             mean = sum(px) / len(px)
             var = sum((p - mean) ** 2 for p in px) / len(px)
-            # Low variance = flat/blurry = high BRISQUE
-            # Very high variance = noisy = high BRISQUE
             if var < 500:
                 return min(100.0, 80.0 - var * 0.1)
             elif var > 4000:
@@ -316,7 +310,6 @@ def compute_colorfulness(img: Image.Image) -> float:
             g = list(g_band.get_flattened_data())
             b = list(b_band.get_flattened_data())
         else:
-            # Pillow < 11 fallback
             r = list(r_band.getdata())
             g = list(g_band.getdata())
             b = list(b_band.getdata())
@@ -339,7 +332,6 @@ def compute_brightness_contrast(img: Image.Image) -> Tuple[float, float]:
         if hasattr(gray, "get_flattened_data"):
             px = list(gray.get_flattened_data())
         else:
-            # Pillow < 11 fallback
             px = list(gray.getdata())
         mean = sum(px) / len(px)
         std = math.sqrt(sum((p - mean) ** 2 for p in px) / len(px))
@@ -355,7 +347,7 @@ def compute_composite(blur: float, brisque: float, resolution: float,
     Combines all inline metrics into a single figure for relative ranking.
     """
     blur_norm = min(100.0, max(0.0, blur / 10.0)) if blur > 0 else 0.0
-    brisque_norm = max(0.0, 100.0 - brisque)  # invert: lower brisque = higher score
+    brisque_norm = max(0.0, 100.0 - brisque)
     res_norm = min(100.0, resolution / 20000.0)
     color_norm = min(100.0, colorfulness)
     contrast_norm = min(100.0, contrast * 1.5)
@@ -670,7 +662,7 @@ def stage_burst(photos: List[Photo], db: DB) -> List[Photo]:
         # Only look forward in time-sorted list; stop when gap > 5 min
         for pb in valid_sorted[i + 1:]:
             if (ts_map[pb.path] - ts_a).total_seconds() > 300:
-                break  # sorted by time, so all remaining are also >5 min away
+                break
             if pb.path in processed or pb.path not in hash_map:
                 continue
             if ha - hash_map[pb.path] <= DUPLICATE_THRESH:
@@ -805,14 +797,14 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
     Score 0-100. Relative (folder percentiles) + absolute signals.
 
     Point budget:
-      Blur         25 pts  (relative to folder p75)
-      BRISQUE      15 pts  (absolute — lower is better)
-      Composite    15 pts  (relative to folder p75)
-      Label        10 pts  (GOOD/AVERAGE/POOR from composite)
-      Burst winner 10 pts
-      Event unique 10 pts
-      Vision       10 pts  (x2.5 weight when no vision, to compensate)
-                          (excellent=+20, good=+12, avg=0, poor=-15)
+      Blur           25 pts  (relative to folder p75)
+      BRISQUE        15 pts  (absolute — lower is better)
+      Composite      15 pts  (relative to folder p75)
+      Label          10 pts  (GOOD/AVERAGE/POOR from composite)
+      Burst winner   10 pts
+      Event unique   10 pts
+      Vision quality 10 pts  (excellent=+20, good=+12, avg=0, poor=-15)
+      Memorability   15 pts  (1-5 scale from vision, semantic value)
     Total possible: ~100+ before clamping
 
     Hard overrides:
@@ -831,9 +823,9 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
     QUALITY_MAP = {"excellent": 20, "good": 12, "average": 0, "poor": -15}
     LABEL_MAP   = {"GOOD": 10, "AVERAGE": 0, "POOR": -10}
 
-    # Vision weight: higher when no vision data available to compensate
-    has_any_vision = any(p.vision_model for p in photos)
-    vision_weight = 1.0 if has_any_vision else 2.5
+    # Memorability: 1=mundane, 2=ordinary, 3=decent, 4=memorable, 5=exceptional
+    # Maps to -5 / 0 / +5 / +10 / +15
+    MEMO_MAP = {1: -5, 2: 0, 3: 5, 4: 10, 5: 15}
 
     for p in photos:
         s = 50.0
@@ -886,9 +878,13 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
         if p.event_id and event_counts[p.event_id] == 1:
             s += 10
 
-        # ── Vision quality (10 pts base, weighted) ───────────────────────
+        # ── Vision quality (10 pts) ──────────────────────────────────────
         if p.vision_quality:
-            s += QUALITY_MAP.get(p.vision_quality.lower(), 0) * vision_weight
+            s += QUALITY_MAP.get(p.vision_quality.lower(), 0)
+
+        # ── Memorability (15 pts, semantic — only from vision) ───────────
+        if p.vision_memorability > 0:
+            s += MEMO_MAP.get(p.vision_memorability, 0)
 
         p.score = max(0, min(100, int(s)))
 
@@ -915,6 +911,8 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
             if p.label == "GOOD":                    parts.append("good quality")
             if p.vision_quality in ("excellent", "good"):
                 parts.append(f"vision:{p.vision_quality}")
+            if p.vision_memorability >= 4:
+                parts.append(f"memorable({p.vision_memorability}/5)")
             p.reason = ", ".join(parts) if parts else "high quality score"
 
         elif p.score <= remove_thresh:
@@ -924,6 +922,7 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
             if p.brisque > 50:                       parts.append("high noise")
             if p.label == "POOR":                    parts.append("poor quality")
             if p.vision_quality == "poor":           parts.append("vision:poor")
+            if p.vision_memorability == 1:           parts.append("mundane")
             p.reason = ", ".join(parts) if parts else "low quality score"
 
         else:
@@ -965,9 +964,18 @@ def stage_vision(photos: List[Photo], db: DB,
                         f'Analyze this photo. Blur={p.blur:.0f}, '
                         f'brisque={p.brisque:.0f}, composite={p.composite_score:.0f}. '
                         f'Reply ONLY with JSON, no fences: '
-                        f'{{"caption":"one sentence","category":"people/landscape/food/'
-                        f'document/animal/architecture/event/other","quality":"excellent/'
-                        f'good/average/poor","keep_reason":"...","delete_reason":"..."}}'
+                        f'{{"caption":"one sentence",'
+                        f'"category":"people/landscape/food/document/animal/architecture/event/other",'
+                        f'"quality":"excellent/good/average/poor",'
+                        f'"memorability":N,'
+                        f'"keep_reason":"...",'
+                        f'"delete_reason":"..."}}\n'
+                        f'memorability: 1=mundane/generic (parking lot, blank wall, accidental shot), '
+                        f'2=ordinary (common scene, nothing special), '
+                        f'3=decent (nice moment, worth reviewing), '
+                        f'4=memorable (special moment, great composition, emotional value), '
+                        f'5=exceptional (once-in-a-lifetime, stunning, deeply personal). '
+                        f'A blurry photo of a meaningful moment scores higher than a sharp photo of nothing.'
                     )
                 else:
                     # llama3.2-vision ignores JSON instructions, use structured text
@@ -975,33 +983,46 @@ def stage_vision(photos: List[Photo], db: DB,
                         "Describe this photo in one sentence.\n"
                         "Then on separate lines write:\n"
                         "QUALITY: excellent/good/average/poor\n"
-                        "CATEGORY: people/landscape/food/document/animal/architecture/event/other"
+                        "CATEGORY: people/landscape/food/document/animal/architecture/event/other\n"
+                        "MEMORABILITY: 1-5 (1=mundane generic shot, 3=decent moment, 5=exceptional/once-in-a-lifetime)\n"
+                        "A blurry photo of a meaningful moment scores higher than a sharp photo of nothing."
                     )
 
                 resp = requests.post(OLLAMA_URL, json={
                     "model": model, "prompt": prompt,
                     "images": [b64], "stream": False,
-                    "options": {"temperature": 0.1, "num_predict": 256}
+                    "options": {"temperature": 0.1, "num_predict": 300}
                 }, timeout=VISION_TIMEOUT)
                 resp.raise_for_status()
                 raw = resp.json().get("response", "").strip()
 
                 if "llava" in model:
                     data = parse_json(raw)
-                    p.caption         = data.get("caption", "")
-                    p.vision_category = data.get("category", "")
-                    p.vision_quality  = data.get("quality", "")
-                    p.vision_keep     = data.get("keep_reason", "")
-                    p.vision_delete   = data.get("delete_reason", "")
+                    p.caption            = data.get("caption", "")
+                    p.vision_category    = data.get("category", "")
+                    p.vision_quality     = data.get("quality", "")
+                    p.vision_keep        = data.get("keep_reason", "")
+                    p.vision_delete      = data.get("delete_reason", "")
+                    memo = data.get("memorability", 0)
+                    try:
+                        p.vision_memorability = max(1, min(5, int(memo)))
+                    except (ValueError, TypeError):
+                        p.vision_memorability = 0
                 else:
                     # Regex parser for llama3.2-vision structured text output
                     qm = re.search(r'QUALITY:\s*(excellent|good|average|poor)', raw, re.I)
                     cm = re.search(r'CATEGORY:\s*(\w+)', raw, re.I)
+                    mm = re.search(r'MEMORABILITY:\s*(\d)', raw, re.I)
                     sentences = [s.strip() for s in raw.replace('\n', ' ').split('.')
                                  if len(s.strip()) > 20]
-                    p.caption        = sentences[0] if sentences else ""
-                    p.vision_quality = qm.group(1).lower() if qm else "average"
-                    p.vision_category = cm.group(1).lower() if cm else "other"
+                    p.caption            = sentences[0] if sentences else ""
+                    p.vision_quality     = qm.group(1).lower() if qm else "average"
+                    p.vision_category    = cm.group(1).lower() if cm else "other"
+                    if mm:
+                        try:
+                            p.vision_memorability = max(1, min(5, int(mm.group(1))))
+                        except (ValueError, TypeError):
+                            p.vision_memorability = 0
 
                 p.vision_model = model
                 db.save(p)
