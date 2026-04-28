@@ -58,17 +58,17 @@ Required packages:
 
 ### Basic Usage
 ```bash
-python main_v2.py --folder "D:\Photos"
+python main_v3.py --folder "D:\Photos"
 ```
 
 ### With Custom Config File
 ```bash
-python main_v2.py --folder "D:\Photos" --config "my_config.json"
+python main_v3.py --folder "D:\Photos" --config "my_config.json"
 ```
 
 ### With CLI Overrides
 ```bash
-python main_v2.py --folder "D:\Photos" --enable-vision --vision-model llava
+python main_v3.py --folder "D:\Photos" --enable-vision --vision-model llava
 ```
 
 ### V1 (Basic) Usage
@@ -99,25 +99,29 @@ The engine uses a JSON configuration file (`config.json`) for most parameters:
 
 ```json
 {
-  "metrics_excel": "path/to/metrics.xlsx",
   "output_dir": "output",
+  "limit": null,
+  "metrics_excel": null,
+
+  "enable_vision": true,
+  "vision_model": "llava",
+  "vision_fallback": "llama3.2-vision",
+  "vision_limit": 75,
+  "enable_faces": false,
+
+  "dry_run": false,
+  "clear_cache": false,
+
   "duplicate_threshold": 8,
   "event_gap_hours": 6,
-  "limit": 10,
-  "v2_features": {
-    "enable_faces": false,
-    "enable_vision": false,
-    "enable_search": false,
-    "vision_model": "llama3.2-vision",
-    "vision_fallback": "llava",
-    "vision_max_images": 50
-  },
-  "processing": {
-    "checkpoint_interval": 10,
-    "blur_threshold": 80.0
-  }
+  "blur_threshold": 80.0,
+
+  "ollama_url": "http://localhost:11434/api/generate",
+  "vision_timeout": 300
 }
 ```
+
+`main_v3.py` also accepts legacy nested keys (`v2_features`, `processing`, `models`) for backward compatibility.
 
 ## Input Requirements
 

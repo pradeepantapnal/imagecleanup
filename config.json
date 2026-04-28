@@ -1,23 +1,36 @@
 {
-  "metrics_excel": "sample_metrics.xlsx",
   "output_dir": "output",
+  "limit": null,
+  "metrics_excel": null,
+
+  "enable_vision": true,
+  "vision_model": "llava",
+  "vision_fallback": "llama3.2-vision",
+  "vision_limit": 75,
+  "enable_faces": false,
+
+  "dry_run": false,
+  "clear_cache": false,
+
   "duplicate_threshold": 8,
   "event_gap_hours": 6,
-  "limit": 10,
+  "blur_threshold": 80.0,
+
+  "ollama_url": "http://localhost:11434/api/generate",
+  "vision_timeout": 300,
+
   "v2_features": {
     "enable_faces": false,
     "enable_vision": true,
-    "enable_search": false,
-    "vision_model": "llama3.2-vision",
-    "vision_fallback": "llava",
-    "vision_max_images": 3
+    "vision_model": "llava",
+    "vision_fallback": "llama3.2-vision",
+    "vision_max_images": 75
   },
   "processing": {
-    "checkpoint_interval": 10,
     "blur_threshold": 80.0
   },
   "models": {
     "ollama_url": "http://localhost:11434/api/generate",
-    "vision_timeout": 120
+    "vision_timeout": 300
   }
 }
