@@ -39,6 +39,9 @@ import sqlite3
 import argparse
 import logging
 import requests
+import platform
+import shutil
+import subprocess
 from time import perf_counter, process_time
 from io import BytesIO
 from pathlib import Path
@@ -1243,6 +1246,135 @@ def print_dry_run(photos: List[Photo]):
     print("  (no files written in dry-run mode)\n")
 
 
+def _bytes_to_gb(num_bytes: int) -> float:
+    return round(num_bytes / (1024 ** 3), 1)
+
+
+def _total_memory_bytes() -> Optional[int]:
+    if hasattr(os, "sysconf"):
+        try:
+            pages = os.sysconf("SC_PHYS_PAGES")
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            return int(pages * page_size)
+        except Exception:
+            return None
+    return None
+
+
+def _detect_gpu() -> Tuple[bool, str]:
+    nvidia_smi = shutil.which("nvidia-smi")
+    if not nvidia_smi:
+        return False, "No NVIDIA GPU detected (nvidia-smi unavailable)"
+    try:
+        out = subprocess.check_output(
+            [nvidia_smi, "--query-gpu=name,memory.total", "--format=csv,noheader"],
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=3,
+        ).strip()
+        if not out:
+            return False, "nvidia-smi returned no GPU rows"
+        first = out.splitlines()[0]
+        return True, f"NVIDIA GPU: {first}"
+    except Exception as exc:
+        return False, f"GPU probe failed: {exc}"
+
+
+def detect_runtime_profile(args) -> Dict[str, str]:
+    mem_bytes = _total_memory_bytes()
+    has_gpu, gpu_detail = _detect_gpu()
+    profile = {
+        "host": platform.node() or "unknown",
+        "os": f"{platform.system()} {platform.release()} ({platform.machine()})",
+        "python": sys.version.split()[0],
+        "cpu_cores": str(os.cpu_count() or "unknown"),
+        "ram": f"{_bytes_to_gb(mem_bytes)} GB" if mem_bytes else "unknown",
+        "gpu": gpu_detail,
+        "opencv": "available" if HAS_CV2 else "missing (fallback blur estimator)",
+        "clip_lib": "available" if HAS_CLIP else "missing",
+        "face_lib": "available" if HAS_FACES else "missing",
+        "vision_requested": "yes" if args.enable_vision else "no",
+        "vision_model": args.vision_model,
+        "vision_fallback": args.vision_fallback,
+    }
+
+    if args.enable_vision:
+        try:
+            resp = requests.get("http://localhost:11434/api/tags", timeout=2)
+            names = [m.get("name", "") for m in resp.json().get("models", [])]
+            names_str = ", ".join(names[:10]) if names else "(none)"
+            profile["ollama"] = "reachable"
+            profile["ollama_models"] = names_str
+            profile["vision_model_ready"] = "yes" if any(n.startswith(args.vision_model) for n in names) else "no"
+            profile["vision_fallback_ready"] = "yes" if any(n.startswith(args.vision_fallback) for n in names) else "no"
+        except Exception as exc:
+            profile["ollama"] = f"unreachable ({exc})"
+            profile["ollama_models"] = "unknown"
+            profile["vision_model_ready"] = "unknown"
+            profile["vision_fallback_ready"] = "unknown"
+    return profile
+
+
+def print_runtime_profile(profile: Dict[str, str]):
+    print("\n-- DRY RUN: Hardware + Model Capability Analysis -----------")
+    print(f"  Host             : {profile['host']}")
+    print(f"  OS               : {profile['os']}")
+    print(f"  Python           : {profile['python']}")
+    print(f"  CPU cores        : {profile['cpu_cores']}")
+    print(f"  RAM              : {profile['ram']}")
+    print(f"  GPU              : {profile['gpu']}")
+    print(f"  OpenCV           : {profile['opencv']}")
+    print(f"  CLIP library     : {profile['clip_lib']}")
+    print(f"  Face library     : {profile['face_lib']}")
+    print(f"  Vision requested : {profile['vision_requested']}")
+    print(f"  Vision model     : {profile['vision_model']}")
+    if "ollama" in profile:
+        print(f"  Ollama           : {profile['ollama']}")
+        print(f"  Models           : {profile['ollama_models']}")
+        print(f"  Model ready      : {profile['vision_model_ready']}")
+        print(f"  Fallback ready   : {profile['vision_fallback_ready']}")
+    print("")
+
+
+def print_runtime_estimates(photos: List[Photo], args, profile: Dict[str, str]):
+    total = len(photos)
+    ambiguous = sum(1 for p in photos if VISION_BAND_LOW <= p.score <= VISION_BAND_HIGH)
+    vision_calls = min(ambiguous, args.vision_limit) if args.enable_vision else 0
+    cpu_cores = os.cpu_count() or 4
+    has_gpu = profile.get("gpu", "").startswith("NVIDIA GPU")
+
+    per_image = 0.06 if cpu_cores <= 4 else 0.045 if cpu_cores <= 8 else 0.03
+    if not HAS_CV2:
+        per_image += 0.015
+    clip_cost = 0.02 if HAS_CLIP else 0.0
+    vision_cost = 2.5 if has_gpu else 6.0
+    output_cost = 0.25 if args.dry_run else 1.5
+
+    est_secs = total * (per_image + clip_cost) + (vision_calls * vision_cost) + output_cost
+    low = max(1, int(est_secs * 0.7))
+    high = max(low + 1, int(est_secs * 1.35))
+
+    print("-- DRY RUN: Runtime Estimate -------------------------------")
+    print(f"  Photos scanned          : {total}")
+    print(f"  Ambiguous (score 35-65) : {ambiguous}")
+    print(f"  Vision calls planned    : {vision_calls} (limit={args.vision_limit})")
+    print(f"  Estimated runtime       : {low}s to {high}s")
+    print("  Notes                   : Range includes I/O variance, cache hits, and model warm-up.\n")
+
+
+def print_teaser_results(photos: List[Photo]):
+    ranked = sorted([p for p in photos if p.file_exists], key=lambda p: p.score)
+    if not ranked:
+        print("-- DRY RUN: Teaser Results --------------------------------")
+        print("  No valid images found to preview.\n")
+        return
+
+    print("-- DRY RUN: Teaser Results --------------------------------")
+    for p in ranked[:5]:
+        print(f"  REMOVE-candidate teaser : score={p.score:3d}  file={p.filename}  reason={p.reason or 'low-quality signal'}")
+    print("")
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description=f"Photo Cleanup Engine v{VERSION}")
@@ -1290,6 +1422,11 @@ def main():
     log.info(f"Photo Cleanup Engine v{VERSION}")
     log.info(f"Folder       : {args.folder}")
     log.info(f"Config       : limit={args.limit or 'all'} vision={args.enable_vision} faces={args.enable_faces}")
+    if args.dry_run:
+        profile = detect_runtime_profile(args)
+        print_runtime_profile(profile)
+    else:
+        profile = {}
 
     metrics = None
     if args.metrics_excel:
@@ -1341,6 +1478,8 @@ def main():
         if args.dry_run:
             with stage_timer("Dry-run summary"):
                 print_dry_run(photos)
+                print_runtime_estimates(photos, args, profile)
+                print_teaser_results(photos)
         else:
             with stage_timer("Write Excel"):
                 write_excel(photos, str(out_dir / "photo_cleanup.xlsx"))
