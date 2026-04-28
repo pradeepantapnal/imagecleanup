@@ -39,7 +39,7 @@ import sqlite3
 import argparse
 import logging
 import requests
-from time import perf_counter
+from time import perf_counter, process_time
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime
@@ -165,13 +165,19 @@ class DB:
     def __init__(self, path: str):
         self.conn = sqlite3.connect(path)
         cols = []
+        col_defs = {}
         for f in Photo.__dataclass_fields__.values():
             t = "BOOLEAN" if f.type in (bool, "bool") else \
                 "INTEGER"  if f.type in (int, "int")   else \
                 "REAL"     if f.type in (float, "float") else "TEXT"
             cols.append(f"{f.name} {t}")
+            col_defs[f.name] = t
         cols[0] = "path TEXT PRIMARY KEY"
         self.conn.execute(f"CREATE TABLE IF NOT EXISTS photos ({', '.join(cols)})")
+        existing = {r[1] for r in self.conn.execute("PRAGMA table_info(photos)").fetchall()}
+        for col_name, col_type in col_defs.items():
+            if col_name not in existing:
+                self.conn.execute(f"ALTER TABLE photos ADD COLUMN {col_name} {col_type}")
         self.conn.commit()
 
     def save(self, p: Photo):
@@ -225,16 +231,18 @@ log = logging.getLogger("photo")
 @contextmanager
 def stage_timer(label: str):
     started_at = datetime.now().astimezone()
-    tick = perf_counter()
+    wall_tick = perf_counter()
+    cpu_tick = process_time()
     log.info(f"[START] {label} @ {started_at.isoformat(timespec='milliseconds')}")
     try:
         yield
     finally:
         finished_at = datetime.now().astimezone()
-        elapsed = perf_counter() - tick
+        elapsed_wall = perf_counter() - wall_tick
+        elapsed_cpu = process_time() - cpu_tick
         log.info(
             f"[END]   {label} @ {finished_at.isoformat(timespec='milliseconds')} "
-            f"(elapsed={elapsed:.2f}s)"
+            f"(elapsed_wall={elapsed_wall:.2f}s, elapsed_cpu={elapsed_cpu:.2f}s)"
         )
 
 
@@ -951,12 +959,22 @@ def stage_vision(photos: List[Photo], db: DB,
 
     log.info(f"S7 vision    : {len(candidates)} candidates (score {VISION_BAND_LOW}-{VISION_BAND_HIGH})")
 
+    attempts = 0
+    successes = 0
+    fallback_successes = 0
+    timeouts = 0
+    json_fails = 0
+    other_errors = 0
+    api_wall_total = 0.0
+    api_cpu_total = 0.0
+
     for p in tqdm(candidates, desc="S7 vision"):
         b64 = to_b64(Path(p.path))
         if not b64:
             continue
 
         for model in [primary, fallback]:
+            attempts += 1
             try:
                 # Model-aware prompts: llava returns JSON, llama3.2-vision returns text
                 if "llava" in model:
@@ -988,12 +1006,16 @@ def stage_vision(photos: List[Photo], db: DB,
                         "A blurry photo of a meaningful moment scores higher than a sharp photo of nothing."
                     )
 
+                api_wall_tick = perf_counter()
+                api_cpu_tick = process_time()
                 resp = requests.post(OLLAMA_URL, json={
                     "model": model, "prompt": prompt,
                     "images": [b64], "stream": False,
                     "options": {"temperature": 0.1, "num_predict": 300}
                 }, timeout=VISION_TIMEOUT)
                 resp.raise_for_status()
+                api_wall_total += perf_counter() - api_wall_tick
+                api_cpu_total += process_time() - api_cpu_tick
                 raw = resp.json().get("response", "").strip()
 
                 if "llava" in model:
@@ -1026,21 +1048,36 @@ def stage_vision(photos: List[Photo], db: DB,
 
                 p.vision_model = model
                 db.save(p)
+                successes += 1
+                if model != primary:
+                    fallback_successes += 1
                 break  # success, skip fallback
 
             except (ValueError, json.JSONDecodeError) as e:
                 log.warning(f"Vision JSON fail {Path(p.path).name} ({model}): {e}")
                 p.error = f"vision_json:{model}"
+                json_fails += 1
             except requests.exceptions.Timeout:
                 log.warning(f"Vision timeout {Path(p.path).name} ({model})")
                 p.error = f"vision_timeout:{model}"
+                timeouts += 1
             except Exception as e:
                 log.warning(f"Vision error {Path(p.path).name} ({model}): {type(e).__name__}")
                 p.error = f"vision_err:{model}"
+                other_errors += 1
 
     # Re-score with vision data incorporated
     photos = compute_scores(photos)
-    log.info(f"             : {sum(1 for p in photos if p.vision_model)} processed")
+    processed = sum(1 for p in photos if p.vision_model)
+    avg_wall = (api_wall_total / successes) if successes else 0.0
+    avg_cpu = (api_cpu_total / successes) if successes else 0.0
+    log.info(
+        "             : "
+        f"{processed} processed | attempts={attempts} success={successes} "
+        f"fallback_success={fallback_successes} timeout={timeouts} "
+        f"json_fail={json_fails} error={other_errors} "
+        f"| vision_avg_wall={avg_wall:.2f}s vision_avg_cpu={avg_cpu:.2f}s"
+    )
     return photos
 
 
@@ -1247,6 +1284,7 @@ def main():
         log.info("Cache        : cleared")
 
     start = datetime.now()
+    start_cpu = process_time()
     ck = cache_key(args.folder, args.metrics_excel)
 
     log.info(f"Photo Cleanup Engine v{VERSION}")
@@ -1309,8 +1347,9 @@ def main():
             with stage_timer("Write CSV"):
                 write_csv(photos, str(out_dir / "photo_cleanup.csv"))
 
-        secs = (datetime.now() - start).total_seconds()
-        log.info(f"Done         : {len(photos)} photos in {secs:.0f}s")
+        wall_secs = (datetime.now() - start).total_seconds()
+        cpu_secs = process_time() - start_cpu
+        log.info(f"Done         : {len(photos)} photos in wall={wall_secs:.0f}s cpu={cpu_secs:.0f}s")
 
     finally:
         db.close()
