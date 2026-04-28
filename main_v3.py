@@ -109,6 +109,81 @@ VISION_TIMEOUT   = 300
 VISION_BAND_LOW  = 35
 VISION_BAND_HIGH = 65
 
+
+def _read_config(path: str) -> dict:
+    cfg_path = Path(path)
+    if not cfg_path.exists():
+        return {}
+    with cfg_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"Config must be a JSON object: {path}")
+    return data
+
+
+def _cfg_get(cfg: dict, *keys, default=None):
+    cur = cfg
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+def _apply_config_defaults(args: argparse.Namespace, cfg: dict) -> argparse.Namespace:
+    # Core paths/options
+    if args.metrics_excel is None:
+        args.metrics_excel = _cfg_get(cfg, "metrics_excel")
+    if args.output_dir is None:
+        args.output_dir = _cfg_get(cfg, "output_dir", default="output")
+    if args.limit is None:
+        args.limit = _cfg_get(cfg, "limit")
+
+    # Feature toggles + vision options (supports legacy nested schema)
+    if args.enable_vision is None:
+        args.enable_vision = bool(_cfg_get(cfg, "enable_vision", default=_cfg_get(cfg, "v2_features", "enable_vision", default=False)))
+    if args.enable_faces is None:
+        args.enable_faces = bool(_cfg_get(cfg, "enable_faces", default=_cfg_get(cfg, "v2_features", "enable_faces", default=False)))
+    if args.vision_model is None:
+        args.vision_model = _cfg_get(cfg, "vision_model", default=_cfg_get(cfg, "v2_features", "vision_model", default="llava"))
+    if args.vision_fallback is None:
+        args.vision_fallback = _cfg_get(cfg, "vision_fallback", default=_cfg_get(cfg, "v2_features", "vision_fallback", default="llama3.2-vision"))
+    if args.vision_limit is None:
+        args.vision_limit = _cfg_get(cfg, "vision_limit", default=_cfg_get(cfg, "v2_features", "vision_max_images", default=20))
+
+    # Execution toggles
+    if args.dry_run is None:
+        args.dry_run = bool(_cfg_get(cfg, "dry_run", default=False))
+    if args.clear_cache is None:
+        args.clear_cache = bool(_cfg_get(cfg, "clear_cache", default=False))
+
+    # Global thresholds / model runtime settings
+    global DUPLICATE_THRESH, EVENT_GAP_HOURS, BLUR_THRESH, OLLAMA_URL, VISION_TIMEOUT
+    DUPLICATE_THRESH = int(_cfg_get(cfg, "duplicate_threshold", default=DUPLICATE_THRESH))
+    EVENT_GAP_HOURS = int(_cfg_get(cfg, "event_gap_hours", default=EVENT_GAP_HOURS))
+    BLUR_THRESH = float(_cfg_get(cfg, "blur_threshold", default=_cfg_get(cfg, "processing", "blur_threshold", default=BLUR_THRESH)))
+    OLLAMA_URL = str(_cfg_get(cfg, "ollama_url", default=_cfg_get(cfg, "models", "ollama_url", default=OLLAMA_URL)))
+    VISION_TIMEOUT = int(_cfg_get(cfg, "vision_timeout", default=_cfg_get(cfg, "models", "vision_timeout", default=VISION_TIMEOUT)))
+
+    if args.output_dir is None:
+        args.output_dir = "output"
+    if args.vision_model is None:
+        args.vision_model = "llava"
+    if args.vision_fallback is None:
+        args.vision_fallback = "llama3.2-vision"
+    if args.vision_limit is None:
+        args.vision_limit = 20
+    if args.enable_vision is None:
+        args.enable_vision = False
+    if args.enable_faces is None:
+        args.enable_faces = False
+    if args.dry_run is None:
+        args.dry_run = False
+    if args.clear_cache is None:
+        args.clear_cache = False
+
+    return args
+
 # ── Data model ─────────────────────────────────────────────────────────────────
 @dataclass
 class Photo:
@@ -1380,29 +1455,33 @@ def main():
     parser = argparse.ArgumentParser(description=f"Photo Cleanup Engine v{VERSION}")
     parser.add_argument("--folder", required=True,
                         help="Path to photo folder")
-    parser.add_argument("--output-dir", default="output",
-                        help="Output directory (default: output)")
+    parser.add_argument("--config", default="config.json",
+                        help="Path to JSON config (default: config.json)")
+    parser.add_argument("--output-dir", default=None,
+                        help="Output directory (default: from config or output)")
     parser.add_argument("--limit", type=int, default=None,
-                        help="Process only N images (default: all)")
-    parser.add_argument("--enable-vision", action="store_true",
+                        help="Process only N images (default: from config or all)")
+    parser.add_argument("--enable-vision", action="store_true", default=None,
                         help="Use Ollama vision LLM on ambiguous photos")
-    parser.add_argument("--enable-faces", action="store_true",
+    parser.add_argument("--enable-faces", action="store_true", default=None,
                         help="Enable face detection and clustering")
-    parser.add_argument("--vision-model", default="llava",
-                        help="Primary Ollama vision model (default: llava)")
-    parser.add_argument("--vision-fallback", default="llama3.2-vision",
-                        help="Fallback vision model")
-    parser.add_argument("--vision-limit", type=int, default=20,
-                        help="Max images to send to vision LLM (default: 20)")
+    parser.add_argument("--vision-model", default=None,
+                        help="Primary Ollama vision model (default: from config or llava)")
+    parser.add_argument("--vision-fallback", default=None,
+                        help="Fallback vision model (default: from config or llama3.2-vision)")
+    parser.add_argument("--vision-limit", type=int, default=None,
+                        help="Max images to send to vision LLM (default: from config or 20)")
     parser.add_argument("--metrics-excel", default=None,
                         help="Path to metrics Excel file (optional)")
     parser.add_argument("--generate-metrics", action="store_true",
                         help="Generate metrics Excel from folder scan and exit")
-    parser.add_argument("--dry-run", action="store_true",
+    parser.add_argument("--dry-run", action="store_true", default=None,
                         help="Preview score distribution, write no files")
-    parser.add_argument("--clear-cache", action="store_true",
+    parser.add_argument("--clear-cache", action="store_true", default=None,
                         help="Wipe cached results before running")
     args = parser.parse_args()
+    config = _read_config(args.config)
+    args = _apply_config_defaults(args, config)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
