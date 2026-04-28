@@ -1,257 +1,218 @@
-# Intelligent Photo Cleanup Engine
+# Intelligent Photo Cleanup Engine v3.2
 
-A fully local Windows Python tool that analyzes photo folders using existing quality metrics to generate intelligent cleanup recommendations (KEEP/REVIEW/CANDIDATE_REMOVE). No cloud calls, no file deletion - recommendations only.
+A fully local, single-script photo cleanup pipeline. Point it at a folder, get a scored Excel telling you what to keep, review, and remove. No cloud APIs, no file deletion — recommendations only.
 
-## Features
-
-- **Existing Metrics Integration**: Uses your existing Excel quality metrics as the primary signal
-- **Exact Duplicate Detection**: MD5-based identification of identical files
-- **Near-Duplicate/Burst Detection**: pHash similarity with temporal proximity for burst photo groups
-- **CLIP Scene Tagging**: Local CLIP embeddings for broad scene categorization (indoor/outdoor, people/landscape, etc.)
-- **Event Grouping**: Conservative event detection based on timestamps and optional GPS
-- **Deterministic Decision Engine**: Rule-based KEEP/REVIEW/CANDIDATE_REMOVE recommendations
-- **Crash-Safe Resume**: SQLite persistence with automatic checkpointing and resume capability
-- **Multiple Output Formats**: Excel (enriched), CSV (decisions), Markdown (report), and logs
-
-## Architecture
-
-The engine follows a 6-stage pipeline:
-
-1. **Stage 1 - Load and Reconcile**: Load Excel metrics and reconcile with file system
-2. **Stage 2 - Exact Duplicate Detection**: MD5 hashing and grouping
-3. **Stage 3 - Burst Detection**: Near-duplicate detection with temporal proximity
-4. **Stage 4 - CLIP Enrichment**: Scene tagging using local CLIP embeddings
-5. **Stage 5 - Event Grouping**: Time-based event clustering
-6. **Stage 6 - Decision Engine**: Deterministic KEEP/REVIEW/CANDIDATE_REMOVE policy
-
-## Requirements
-
-### Python Dependencies
-```bash
-pip install -r requirements.txt
 ```
-
-Required packages:
-- `openpyxl` - Excel file handling
-- `pillow` - Image processing
-- `imagehash` - Perceptual hashing
-- `opencv-python` - Computer vision operations
-- `tqdm` - Progress bars
-- `clip-by-openai` - CLIP embeddings
-- `torch` - PyTorch for CLIP
-- `numpy` - Numerical operations
-
-### Optional Dependencies
-- **GPU**: CLIP can use GPU acceleration with CUDA, but works on CPU
-- **Existing Metrics Excel**: Required for v1 operation
-
-## Installation
-
-1. Clone or download this repository
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Prepare your metrics Excel file with existing quality scores
-
-## Usage
-
-### Basic Usage
-```bash
 python main_v3.py --folder "D:\Photos"
 ```
 
-### With Custom Config File
-```bash
-python main_v3.py --folder "D:\Photos" --config "my_config.json"
-```
+One command. All metrics computed inline. Output: a 6-column Excel sorted worst-first.
 
-### With CLI Overrides
-```bash
-python main_v3.py --folder "D:\Photos" --enable-vision --vision-model llava
-```
+## What it does
 
-### V1 (Basic) Usage
-```bash
-python main.py --folder "D:\Photos"
-```
+1. **Computes quality metrics** inline for every photo — blur (Laplacian variance), BRISQUE-approximation (MSCN-based), colorfulness, brightness, contrast, resolution
+2. **Detects exact duplicates** via MD5 hashing
+3. **Detects burst sequences** via pHash similarity + timestamp proximity (5-minute window)
+4. **Tags scenes** with CLIP (indoor/outdoor, people/landscape, food, etc.) — GPU-accelerated when available
+5. **Groups into events** by 6-hour timestamp gaps
+6. **Scores each photo 0–100** using relative (folder percentiles) + absolute signals
+7. **Optionally runs vision LLM** (Ollama) on ambiguous photos (score 35–65) for caption, category, quality, and memorability assessment
+8. **Outputs a slim Excel** with 6 columns: Filename, Score/100, Decision, Category, Caption, Reason
 
-### Command-Line Options
+## Output
 
-#### Required
-| Option | Description |
+### Excel (photo_cleanup.xlsx)
+
+Sorted by score ascending (worst first), color-coded:
+
+| Column | Description |
 |--------|-------------|
-| `--folder` | Path to photo folder to scan |
+| Filename | Photo name |
+| Score /100 | Quality score — green (65+), yellow (36–64), red (≤35) |
+| Decision | **KEEP** (green), **REMOVE** (red), or **REVIEW** (yellow) |
+| Category | Scene tag from CLIP or vision LLM |
+| Caption | One-line description (populated when vision runs) |
+| Reason | Why — e.g. "sharp, low noise", "burst duplicate (rank #3)", "blurry" |
 
-#### Optional
-| Option | Description |
-|--------|-------------|
-| `--config` | Path to JSON config file (default: config.json) |
-| `--metrics-excel` | Override metrics Excel path from config |
-| `--output-dir` | Override output directory from config |
-| `--limit` | Override image limit from config |
-| `--enable-vision` | Override: enable vision LLM enrichment |
-| `--vision-model` | Override vision model from config |
+Summary footer shows KEEP/REMOVE/REVIEW totals.
 
-## Configuration File
+### How to use the Excel
 
-The engine uses a JSON configuration file (`config.json`) for most parameters:
+Start from the top (lowest scores). The REMOVE block is mostly duplicates and burst copies — confirm and delete. The REVIEW block needs manual judgment — photos near 65 are probably keepers, near 35 probably not. The KEEP block can be ignored unless you want to trim further.
+
+## Scoring formula
+
+Baseline: 50 points. Signals add or subtract:
+
+| Signal | Points | Type |
+|--------|--------|------|
+| Blur sharpness | 25 | Relative to folder 75th percentile |
+| BRISQUE quality | 15 | Absolute (lower BRISQUE = better) |
+| Composite score | 15 | Relative to folder 75th percentile |
+| Quality label | 10 | GOOD/AVERAGE/POOR from composite |
+| Burst winner | 10 | Best photo in burst group |
+| Event uniqueness | 10 | Only photo in its event |
+| Vision quality | 10 | excellent/good/average/poor from LLM |
+| Memorability | 15 | 1–5 semantic score from LLM |
+
+Hard overrides bypass scoring: exact duplicate copies get score=10 REMOVE, burst non-winners get score=20 REMOVE.
+
+Decision thresholds: KEEP ≥ 65, REMOVE ≤ 35. Thresholds tighten to 70/30 when vision has covered >50% of the ambiguous band.
+
+## Installation
+
+```
+pip install openpyxl pillow imagehash opencv-python tqdm numpy
+pip install git+https://github.com/openai/CLIP.git torch torchvision
+```
+
+For GPU-accelerated CLIP (recommended with NVIDIA GPU):
+```
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+```
+
+For vision LLM features, install [Ollama](https://ollama.com) and pull models:
+```
+ollama pull llava
+ollama pull llama3.2-vision
+```
+
+## Usage
+
+### Basic — compute everything, no LLM
+```
+python main_v3.py --folder "D:\Photos\Naples"
+```
+
+### With vision LLM on ambiguous photos
+```
+python main_v3.py --folder "D:\Photos" --enable-vision --vision-limit 200
+```
+
+### Preview score distribution without writing files
+```
+python main_v3.py --folder "D:\Photos" --dry-run
+```
+
+### Process a subset
+```
+python main_v3.py --folder "D:\Photos" --limit 100
+```
+
+### Use config file for defaults
+```
+python main_v3.py --folder "D:\Photos" --config config.json
+```
+
+### Generate metrics workbook (for external tools)
+```
+python main_v3.py --folder "D:\Photos" --generate-metrics
+```
+
+### Fresh run (clear cached results)
+```
+python main_v3.py --folder "D:\Photos" --clear-cache
+```
+
+## Command-line options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--folder` | (required) | Path to photo folder |
+| `--output-dir` | `output` | Where to write Excel, CSV, logs, cache |
+| `--limit` | all | Process only N images |
+| `--enable-vision` | off | Run Ollama vision LLM on score 35–65 band |
+| `--vision-model` | `llava` | Primary Ollama model (returns JSON) |
+| `--vision-fallback` | `llama3.2-vision` | Fallback model (returns structured text) |
+| `--vision-limit` | 20 | Max images to send to vision |
+| `--metrics-excel` | none | Optional external metrics workbook |
+| `--generate-metrics` | off | Write metrics workbook and exit |
+| `--enable-faces` | off | Face detection and clustering |
+| `--dry-run` | off | Preview only, no files written |
+| `--clear-cache` | off | Delete cache.db before running |
+| `--config` | `config.json` | JSON config file (CLI overrides config) |
+
+## Configuration file (config.json)
+
+All CLI options can be set as defaults in `config.json`. CLI arguments override config values.
 
 ```json
 {
   "output_dir": "output",
   "limit": null,
   "metrics_excel": null,
-
-  "enable_vision": true,
+  "enable_vision": false,
   "vision_model": "llava",
   "vision_fallback": "llama3.2-vision",
   "vision_limit": 75,
   "enable_faces": false,
-
   "dry_run": false,
   "clear_cache": false,
-
   "duplicate_threshold": 8,
   "event_gap_hours": 6,
   "blur_threshold": 80.0,
-
   "ollama_url": "http://localhost:11434/api/generate",
   "vision_timeout": 300
 }
 ```
 
-`main_v3.py` also accepts legacy nested keys (`v2_features`, `processing`, `models`) for backward compatibility.
+## Architecture
 
-## Input Requirements
+Seven-stage pipeline with SQLite caching for crash-safe resume:
 
-### Metrics Excel Format
-The Excel file must contain quality metrics for your photos. Expected columns include:
-- `path` or `filename` - Image file path
-- `composite_score` - Overall quality score
-- `blur` - Blur detection score
-- `sharpness` - Sharpness metric
-- `resolution` - Image resolution
-
-## Output Files
-
-The engine generates four outputs in the specified directory:
-
-### 1. `photo_report_enriched.xlsx`
-Enriched Excel file with original metrics plus new analysis columns:
-- Reconciliation status (file/metrics existence)
-- Duplicate detection results
-- Burst detection results
-- CLIP scene tags
-- Event grouping
-- Final decisions with reasoning
-
-### 2. `photo_decisions.csv`
-Machine-readable CSV with cleanup decisions:
-- File path and existence status
-- Final decision (KEEP/REVIEW/CANDIDATE_REMOVE)
-- Decision confidence and reasoning
-- Key metrics for sorting/filtering
-
-### 3. `photo_report.md`
-Human-readable Markdown report with:
-- Summary statistics
-- Decision breakdown
-- Recommendations
-- Processing summary
-
-### 4. `engine.log`
-Detailed processing log with:
-- Stage-by-stage progress
-- Error messages
-- Performance metrics
-
-### 5. `photo_cache.db`
-SQLite database for crash-safe resume:
-- Cached computation results
-- Pipeline state
-- Configuration fingerprint
-
-## Decision Engine Logic
-
-The deterministic decision engine applies rules in this order:
-
-1. **Missing Files** → REVIEW (file in Excel but not on disk)
-2. **Missing Metrics** → REVIEW (file exists but no quality metrics)
-3. **Exact Duplicate Losers** → CANDIDATE_REMOVE (lower-ranked duplicates)
-4. **Burst Non-Winners** → CANDIDATE_REMOVE (lower quality burst photos)
-5. **Burst Winners** → KEEP (best quality in burst group)
-6. **Only Image in Event** → KEEP (sole representative of event)
-7. **Low Quality Unique** → REVIEW (low composite score)
-8. **Default** → KEEP (event representative)
-
-## Crash-Safe Resume
-
-The engine automatically resumes from interruptions:
-- SQLite database caches all computation results
-- Configuration fingerprint detects parameter changes
-- Checkpoint after every N images and stage boundaries
-- Skips already-completed work when config unchanged
-
-## Configuration
-
-Edit constants in `main.py` to customize behavior:
-
-```python
-SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif", ".heic"}
-DUPLICATE_THRESH = 8      # Hamming distance for near-duplicates
-BLUR_THRESH = 80.0         # Laplacian variance threshold
-EVENT_GAP_HOURS = 6        # Time gap for event grouping
-CHECKPOINT_INTERVAL = 10  # Checkpoint every N images
+```
+S1  Load + inline metrics  →  blur, BRISQUE, composite, colorfulness, brightness, contrast
+S2  Duplicate detection    →  MD5 exact match grouping
+S3  Burst detection        →  pHash + timestamp proximity (pre-computed, O(n) not O(n²))
+S4  CLIP tagging           →  scene classification (GPU when available)
+S5  Event grouping         →  6-hour timestamp gap clustering
+S6  Face detection         →  (optional) face_recognition clustering
+    Scoring                →  0–100 score, KEEP/REMOVE/REVIEW decision
+S7  Vision LLM             →  (optional) Ollama on ambiguous band, adds memorability
+    Re-score               →  incorporate vision signals, write Excel + CSV
 ```
 
-## Performance Notes
+Cache persists across runs. Reruns skip completed stages. Cache auto-invalidates when folder or metrics path changes.
 
-- **Exact duplicates**: Fast, MD5 hashing
-- **Burst detection**: Medium, pHash + temporal analysis
-- **CLIP embeddings**: Slower, benefits from GPU acceleration
-- **Event grouping**: Fast, timestamp-based
-- **Decision engine**: Very fast, rule-based
+## Vision LLM details
 
-## Troubleshooting
+Vision fires only on photos scoring 35–65 (the ambiguous band). Two model-aware prompt strategies:
 
-### "Metrics Excel not found"
-- Ensure the Excel file path is correct
-- Verify the file contains the expected columns
+**llava** — gets a JSON prompt, returns structured data including memorability 1–5. Memorability scale: 1=mundane (parking lot, accidental shot), 3=decent moment, 5=exceptional (once-in-a-lifetime). Key instruction: "A blurry photo of a meaningful moment scores higher than a sharp photo of nothing."
 
-### "CLIP not available"
-- Install with: `pip install clip-by-openai torch`
-- CLIP is optional; engine works without it (scene tagging will be limited)
+**llama3.2-vision** — ignores JSON instructions, gets structured text prompt (QUALITY/CATEGORY/MEMORABILITY tags), parsed with regex. Used as fallback when llava fails.
 
-### "Out of memory"
-- Process folders in smaller batches using `--limit`
-- CLIP embeddings can be memory-intensive
+## Performance
 
-### "Resume not working"
-- Check that configuration hasn't changed
-- Verify the cache database isn't corrupted
-- Delete `photo_cache.db` to start fresh
+Tested on 2287 photos (Camera folder) with RTX 2000 Ada 8GB:
 
-## v2 Roadmap
+| Stage | Time |
+|-------|------|
+| S1 metrics (fresh) | ~17 min |
+| S1 metrics (cached) | <1 sec |
+| S2 duplicates | ~45 sec |
+| S3 burst detection | ~5 min (optimized) |
+| S4 CLIP (GPU) | ~2 min |
+| S4 CLIP (CPU) | ~21 min |
+| S7 vision (400 photos) | ~1h 44min |
 
-Features planned for future versions:
-- Face detection and clustering
-- Selective vision LLM review
-- Semantic caption search
-- Smarter event naming
-- Advanced deduplication algorithms
+## Dependencies
+
+### Required
+- `openpyxl` — Excel output
+- `pillow` — image processing
+- `imagehash` — perceptual hashing
+
+### Recommended
+- `opencv-python` — faster blur/BRISQUE computation
+- `tqdm` — progress bars
+- `numpy` — numeric operations
+
+### Optional
+- `clip` + `torch` — scene tagging (GPU recommended)
+- `face_recognition` — face detection/clustering
+- Ollama with `llava` / `llama3.2-vision` — vision LLM
 
 ## License
 
-This project is provided as-is for personal photo organization.
-
-## Design Philosophy
-
-**v1 focuses on stability and determinism:**
-- Existing metrics first, AI enrichment second
-- Rule-based decisions over probabilistic approaches
-- Conservative event grouping
-- Crash-safe operation
-- Fully local processing
-
-This ensures reliable, repeatable results for photo cleanup tasks.
+Personal use. 100% local processing, no cloud APIs.
