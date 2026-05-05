@@ -35,6 +35,7 @@ import json
 import math
 import base64
 import hashlib
+import importlib.util
 import sqlite3
 import argparse
 import logging
@@ -73,7 +74,6 @@ except ImportError:
 # ── Optional ───────────────────────────────────────────────────────────────────
 try:
     import cv2
-    import numpy as np
     HAS_CV2 = True
 except ImportError:
     HAS_CV2 = False
@@ -86,18 +86,8 @@ except ImportError:
     def tqdm(it, **kw):
         return it
 
-try:
-    import clip
-    import torch
-    HAS_CLIP = True
-except ImportError:
-    HAS_CLIP = False
-
-try:
-    import face_recognition
-    HAS_FACES = True
-except ImportError:
-    HAS_FACES = False
+HAS_CLIP = False
+HAS_FACES = False
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 VERSION          = "3.2"
@@ -107,8 +97,8 @@ BLUR_THRESH      = 80.0
 EVENT_GAP_HOURS  = 6
 OLLAMA_URL       = "http://localhost:11434/api/generate"
 VISION_TIMEOUT   = 300
-VISION_BAND_LOW  = 35
-VISION_BAND_HIGH = 65
+VISION_BAND_LOW  = 45
+VISION_BAND_HIGH = 55
 
 
 def _read_config(path: str) -> dict:
@@ -371,6 +361,7 @@ def compute_brisque_approx(path: Path) -> float:
     """
     try:
         if HAS_CV2:
+            import numpy as np
             img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
             if img is None:
                 return 50.0
@@ -772,6 +763,7 @@ def _extract_sensor_state(pil_img) -> tuple[float, float]:
     return iso_speed, exposure_time_s
 
 def compute_photo_metrics_worker(path_str: str, ck: str) -> dict:
+    import numpy as np  # noqa: F401 - required by metric helpers in worker process
     img = Path(path_str)
     out = {
         "path": str(img),
@@ -793,11 +785,11 @@ def compute_photo_metrics_worker(path_str: str, ck: str) -> dict:
         return out
     try:
         with Image.open(img) as pil_img:
-            rgb = pil_img.convert("RGB")
             out["width"], out["height"] = pil_img.size
             out["resolution"] = float(out["width"] * out["height"])
-            out["colorfulness"] = round(compute_colorfulness(rgb), 2)
             out["iso_speed"], out["exposure_time_s"] = _extract_sensor_state(pil_img)
+            rgb = pil_img.convert("RGB")
+            out["colorfulness"] = round(compute_colorfulness(rgb), 2)
             brt, ctr = compute_brightness_contrast(rgb)
             out["brightness"] = round(brt, 2)
             out["contrast"] = round(ctr, 2)
@@ -962,7 +954,10 @@ def stage_burst(photos: List[Photo], db: DB) -> List[Photo]:
 
 # ── Stage 4: CLIP tagging ─────────────────────────────────────────────────────
 def stage_clip(photos: List[Photo], db: DB) -> List[Photo]:
-    if not HAS_CLIP:
+    try:
+        import clip
+        import torch
+    except ImportError:
         log.info("S4 CLIP      : skipped (not installed)")
         return photos
 
@@ -974,7 +969,10 @@ def stage_clip(photos: List[Photo], db: DB) -> List[Photo]:
         labels = ["indoor", "outdoor", "day", "night", "people", "landscape",
                   "document", "food", "animal", "architecture", "screenshot", "event"]
         tokens = clip.tokenize([f"a photo of {c}" for c in categories]).to(device)
-        valid = [p for p in photos if p.file_exists and not p.clip_tags]
+        valid = [
+            p for p in photos
+            if p.file_exists and not p.clip_tags and p.resolution > 0 and not (p.error or "").startswith("worker:")
+        ]
         log.info(f"S4 CLIP      : {len(valid)} images ({device})")
         for p in tqdm(valid, desc="S4 CLIP"):
             try:
@@ -1025,10 +1023,16 @@ def stage_events(photos: List[Photo], db: DB) -> List[Photo]:
 
 # ── Stage 6: Face detection ───────────────────────────────────────────────────
 def stage_faces(photos: List[Photo], db: DB) -> List[Photo]:
-    if not HAS_FACES:
+    try:
+        import face_recognition
+    except ImportError:
         log.info("S6 faces     : skipped (not installed)")
         return photos
-    valid = [p for p in photos if p.file_exists and not p.has_faces and p.face_count == 0]
+    valid = [
+        p for p in photos
+        if p.file_exists and not p.has_faces and p.face_count == 0
+        and p.resolution > 0 and not (p.error or "").startswith("worker:")
+    ]
     log.info(f"S6 faces     : {len(valid)} images")
     all_encs = []
     for p in tqdm(valid, desc="S6 faces"):
@@ -1253,13 +1257,18 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
             p.decision = "REVIEW"
             p.reason = "ambiguous -- manual review suggested"
 
-        # Bayesian veto gate: semantic value can override weak deterministic prior
-        if p.decision in ("REVIEW", "REMOVE"):
-            category = (p.vision_category or "").strip().lower()
-            quality = (p.vision_quality or "").strip().lower()
-            if quality == "good" and category in high_value_categories:
-                p.decision = "KEEP"
-                p.reason = "VLM Veto: High-value content despite low sharpness"
+        # Bayesian veto gate: VLM quality can aggressively override borderline outcomes.
+        category = (p.vision_category or "").strip().lower()
+        quality = (p.vision_quality or "").strip().lower()
+        if quality == "poor" and p.decision in ("REVIEW", "REMOVE"):
+            p.decision = "REMOVE"
+            p.reason = "VLM Veto: poor quality confirmed"
+        elif quality == "excellent":
+            p.decision = "KEEP"
+            p.reason = "VLM Veto: excellent quality override"
+        elif p.decision in ("REVIEW", "REMOVE") and quality == "good" and category in high_value_categories:
+            p.decision = "KEEP"
+            p.reason = "VLM Veto: High-value content despite low sharpness"
 
     scored = [p for p in photos if p.score >= 0]
     if scored:
@@ -1611,6 +1620,8 @@ def _detect_gpu() -> Tuple[bool, str]:
 def detect_runtime_profile(args) -> Dict[str, str]:
     mem_bytes = _total_memory_bytes()
     has_gpu, gpu_detail = _detect_gpu()
+    clip_available = importlib.util.find_spec("clip") is not None and importlib.util.find_spec("torch") is not None
+    face_available = importlib.util.find_spec("face_recognition") is not None
     profile = {
         "host": platform.node() or "unknown",
         "os": f"{platform.system()} {platform.release()} ({platform.machine()})",
@@ -1619,8 +1630,8 @@ def detect_runtime_profile(args) -> Dict[str, str]:
         "ram": f"{_bytes_to_gb(mem_bytes)} GB" if mem_bytes else "unknown",
         "gpu": gpu_detail,
         "opencv": "available" if HAS_CV2 else "missing (fallback blur estimator)",
-        "clip_lib": "available" if HAS_CLIP else "missing",
-        "face_lib": "available" if HAS_FACES else "missing",
+        "clip_lib": "available" if clip_available else "missing",
+        "face_lib": "available" if face_available else "missing",
         "vision_requested": "yes" if args.enable_vision else "no",
         "vision_model": args.vision_model,
         "vision_fallback": args.vision_fallback,
@@ -1769,6 +1780,15 @@ def main():
         log.info(f"Metrics      : loaded from {args.metrics_excel}")
 
     db = DB(str(out_dir / "cache.db"))
+    stale_error_count = db.conn.execute(
+        "SELECT COUNT(*) FROM photos WHERE (error LIKE 'worker:%' OR resolution=0) AND cache_key<>?",
+        (ck,)
+    ).fetchone()[0]
+    if stale_error_count and not args.clear_cache:
+        raise RuntimeError(
+            f"Found {stale_error_count} stale/corrupted cached rows from prior runs. "
+            f"Re-run with --clear-cache to avoid cascading failures in CLIP/face stages."
+        )
 
     try:
         with stage_timer("Scan images"):
