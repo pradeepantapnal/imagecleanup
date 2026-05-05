@@ -42,6 +42,7 @@ import requests
 import platform
 import shutil
 import subprocess
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from time import perf_counter, process_time
 from io import BytesIO
 from pathlib import Path
@@ -221,6 +222,7 @@ class Photo:
     has_faces: bool = False
     face_count: int = 0
     person_ids: str = ""
+    primary_face_bbox: str = ""
     # Vision LLM
     caption: str = ""
     vision_category: str = ""
@@ -242,6 +244,8 @@ class Photo:
 class DB:
     def __init__(self, path: str):
         self.conn = sqlite3.connect(path)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         cols = []
         col_defs = {}
         for f in Photo.__dataclass_fields__.values():
@@ -265,6 +269,20 @@ class DB:
                f" ON CONFLICT(path) DO UPDATE SET "
                f"{', '.join(f'{c}=excluded.{c}' for c in cols if c != 'path')}")
         self.conn.execute(sql, list(d.values()))
+        self.conn.commit()
+
+    def save_many(self, photos: List[Photo], commit_every: int = 100):
+        if not photos:
+            return
+        for i, p in enumerate(photos, start=1):
+            d = asdict(p)
+            cols = list(d.keys())
+            sql = (f"INSERT INTO photos ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})"
+                   f" ON CONFLICT(path) DO UPDATE SET "
+                   f"{', '.join(f'{c}=excluded.{c}' for c in cols if c != 'path')}")
+            self.conn.execute(sql, list(d.values()))
+            if i % commit_every == 0:
+                self.conn.commit()
         self.conn.commit()
 
     def load(self, path: str) -> Optional[Photo]:
@@ -526,6 +544,67 @@ def to_b64(path: Path, max_size=(800, 800)) -> str:
         return ""
 
 
+def _safe_square_crop(img: Image.Image, cx: int, cy: int, size: int) -> Image.Image:
+    w, h = img.size
+    size = max(32, min(size, w, h))
+    half = size // 2
+    left = max(0, min(cx - half, w - size))
+    top = max(0, min(cy - half, h - size))
+    return img.crop((left, top, left + size, top + size))
+
+
+def vision_multi_patch_b64(path: Path, face_bbox: str = "", panel_size: int = 672) -> str:
+    """
+    Build 3-panel composite:
+      1) full scene (context)
+      2) 1:1 center crop (texture)
+      3) 1:1 primary-face crop if available, else center crop
+    """
+    try:
+        resample = getattr(Image, 'LANCZOS', Image.Resampling.LANCZOS)
+        with Image.open(path) as src:
+            img = src.convert("RGB")
+            w, h = img.size
+            side = min(w, h)
+
+            # Full scene panel
+            full_panel = img.copy()
+            full_panel.thumbnail((panel_size, panel_size), resample)
+            canvas = Image.new("RGB", (panel_size, panel_size), "black")
+            ox = (panel_size - full_panel.width) // 2
+            oy = (panel_size - full_panel.height) // 2
+            canvas.paste(full_panel, (ox, oy))
+            full_panel = canvas
+
+            # Center 1:1 panel
+            center_panel = _safe_square_crop(img, w // 2, h // 2, side).resize((panel_size, panel_size), resample)
+
+            # Primary-face 1:1 panel
+            face_panel = center_panel
+            if face_bbox:
+                try:
+                    t, r, b, l = [int(v) for v in face_bbox.split(",")]
+                    fw = max(1, r - l)
+                    fh = max(1, b - t)
+                    fside = max(fw, fh) * 2
+                    cx = l + fw // 2
+                    cy = t + fh // 2
+                    face_panel = _safe_square_crop(img, cx, cy, fside).resize((panel_size, panel_size), resample)
+                except Exception:
+                    pass
+
+            composite = Image.new("RGB", (panel_size * 3, panel_size), "black")
+            composite.paste(full_panel, (0, 0))
+            composite.paste(center_panel, (panel_size, 0))
+            composite.paste(face_panel, (panel_size * 2, 0))
+
+            buf = BytesIO()
+            composite.save(buf, format="JPEG", quality=88)
+            return base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return ""
+
+
 def parse_json(raw: str) -> dict:
     raw = re.sub(r'^```(?:json)?\s*', '', raw.strip(), flags=re.MULTILINE)
     raw = re.sub(r'```\s*$', '', raw.strip(), flags=re.MULTILINE)
@@ -628,59 +707,106 @@ def _match_metrics_row(img: Path, folder: str, metrics: Dict[str, dict]) -> Opti
     return by_filename.get(img.name.lower())
 
 
+def compute_photo_metrics_worker(path_str: str, ck: str) -> dict:
+    img = Path(path_str)
+    out = {
+        "path": str(img),
+        "filename": img.name,
+        "file_size": 0,
+        "cache_key": ck,
+        "file_exists": True,
+        "width": 0, "height": 0, "resolution": 0.0,
+        "colorfulness": 0.0, "brightness": 0.0, "contrast": 0.0,
+        "blur": 0.0, "brisque": 0.0, "composite_score": 0.0, "label": "",
+        "error": "",
+    }
+    try:
+        out["file_size"] = img.stat().st_size
+    except Exception:
+        out["file_exists"] = False
+        out["error"] = "missing"
+        return out
+    try:
+        with Image.open(img) as pil_img:
+            rgb = pil_img.convert("RGB")
+            out["width"], out["height"] = pil_img.size
+            out["resolution"] = float(out["width"] * out["height"])
+            out["colorfulness"] = round(compute_colorfulness(rgb), 2)
+            brt, ctr = compute_brightness_contrast(rgb)
+            out["brightness"] = round(brt, 2)
+            out["contrast"] = round(ctr, 2)
+    except Exception as e:
+        out["error"] = f"PIL:{e}"
+
+    out["blur"] = round(compute_blur(img), 2)
+    out["brisque"] = round(compute_brisque_approx(img), 2)
+    comp, label = compute_composite(
+        out["blur"], out["brisque"], out["resolution"], out["colorfulness"], out["contrast"]
+    )
+    out["composite_score"] = round(comp, 2)
+    out["label"] = label
+    return out
+
+
 def stage_load(images: List[Path], db: DB, ck: str,
                folder: str, metrics: Optional[Dict[str, dict]] = None) -> List[Photo]:
     log.info(f"S1 load+metrics: {len(images)} images")
-    photos = []
-    for img in tqdm(images, desc="S1 metrics"):
+    photos: List[Photo] = []
+    pending: List[Path] = []
+    pending_cached: List[Photo] = []
+    for img in images:
         cached = db.load(str(img))
         if cached and cached.cache_key == ck and cached.md5:
-            photos.append(cached)
+            pending_cached.append(cached)
             continue
+        pending.append(img)
 
-        p = Photo(path=str(img), filename=img.name,
-                  file_size=img.stat().st_size, cache_key=ck)
-        try:
-            with Image.open(img) as pil_img:
-                rgb = pil_img.convert("RGB")
-                p.width, p.height = pil_img.size
-                p.resolution = p.width * p.height
-                p.colorfulness = round(compute_colorfulness(rgb), 2)
-                brt, ctr = compute_brightness_contrast(rgb)
-                p.brightness = round(brt, 2)
-                p.contrast = round(ctr, 2)
-        except Exception as e:
-            p.error = f"PIL:{e}"
+    photos.extend(pending_cached)
+    to_save_batch: List[Photo] = []
+    max_workers = max(1, os.cpu_count() or 1)
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(compute_photo_metrics_worker, str(img), ck): img for img in pending}
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="S1 metrics"):
+            img = futures[fut]
+            try:
+                result = fut.result()
+            except Exception as e:
+                p = Photo(path=str(img), filename=img.name, cache_key=ck, error=f"worker:{type(e).__name__}")
+                photos.append(p)
+                to_save_batch.append(p)
+                if len(to_save_batch) >= 100:
+                    db.save_many(to_save_batch, commit_every=100)
+                    to_save_batch = []
+                continue
 
-        p.blur = round(compute_blur(img), 2)
-        p.brisque = round(compute_brisque_approx(img), 2)
-        p.composite_score, p.label = compute_composite(
-            p.blur, p.brisque, p.resolution, p.colorfulness, p.contrast
-        )
-        p.composite_score = round(p.composite_score, 2)
+            p = Photo(**result)
+            if metrics:
+                m = _match_metrics_row(img, folder, metrics)
+                if m:
+                    p.blur = round(m.get("blur", p.blur), 2)
+                    p.brisque = round(m.get("brisque", p.brisque), 2)
+                    p.composite_score = round(m.get("composite_score", p.composite_score), 2)
+                    p.label = m.get("label") or p.label
+                    if m.get("resolution", 0) > 0:
+                        p.resolution = m.get("resolution", p.resolution)
+                    if m.get("width", 0) > 0:
+                        p.width = m.get("width", p.width)
+                    if m.get("height", 0) > 0:
+                        p.height = m.get("height", p.height)
+                    if m.get("colorfulness", 0) > 0:
+                        p.colorfulness = m.get("colorfulness", p.colorfulness)
+                    if m.get("brightness", 0) > 0:
+                        p.brightness = m.get("brightness", p.brightness)
+                    if m.get("contrast", 0) > 0:
+                        p.contrast = m.get("contrast", p.contrast)
+            photos.append(p)
+            to_save_batch.append(p)
+            if len(to_save_batch) >= 100:
+                db.save_many(to_save_batch, commit_every=100)
+                to_save_batch = []
 
-        if metrics:
-            m = _match_metrics_row(img, folder, metrics)
-            if m:
-                p.blur = round(m.get("blur", p.blur), 2)
-                p.brisque = round(m.get("brisque", p.brisque), 2)
-                p.composite_score = round(m.get("composite_score", p.composite_score), 2)
-                p.label = m.get("label") or p.label
-                if m.get("resolution", 0) > 0:
-                    p.resolution = m.get("resolution", p.resolution)
-                if m.get("width", 0) > 0:
-                    p.width = m.get("width", p.width)
-                if m.get("height", 0) > 0:
-                    p.height = m.get("height", p.height)
-                if m.get("colorfulness", 0) > 0:
-                    p.colorfulness = m.get("colorfulness", p.colorfulness)
-                if m.get("brightness", 0) > 0:
-                    p.brightness = m.get("brightness", p.brightness)
-                if m.get("contrast", 0) > 0:
-                    p.contrast = m.get("contrast", p.contrast)
-
-        photos.append(p)
-        db.save(p)
+    if to_save_batch:
+        db.save_many(to_save_batch, commit_every=100)
 
     log.info(f"             : {len(photos)} loaded with inline metrics")
     return photos
@@ -846,6 +972,10 @@ def stage_faces(photos: List[Photo], db: DB) -> List[Photo]:
             encs = face_recognition.face_encodings(img, locs)
             p.has_faces = len(locs) > 0
             p.face_count = len(locs)
+            if locs:
+                # Primary face = largest bounding box area
+                primary = max(locs, key=lambda b: max(1, (b[1] - b[3]) * (b[2] - b[0])))
+                p.primary_face_bbox = ",".join(str(v) for v in primary)  # top,right,bottom,left
             for e in encs:
                 all_encs.append((e, p))
             db.save(p)
@@ -1047,7 +1177,7 @@ def stage_vision(photos: List[Photo], db: DB,
     api_cpu_total = 0.0
 
     for p in tqdm(candidates, desc="S7 vision"):
-        b64 = to_b64(Path(p.path))
+        b64 = vision_multi_patch_b64(Path(p.path), p.primary_face_bbox)
         if not b64:
             continue
 
@@ -1059,6 +1189,8 @@ def stage_vision(photos: List[Photo], db: DB,
                     prompt = (
                         f'Analyze this photo. Blur={p.blur:.0f}, '
                         f'brisque={p.brisque:.0f}, composite={p.composite_score:.0f}. '
+                        f'Input is a 3-panel composite: LEFT=full scene, MIDDLE=center 1:1 crop, RIGHT=primary-face 1:1 crop (or center fallback). '
+                        f'Use all panels, especially MIDDLE/RIGHT for fine texture and sharpness judgments. '
                         f'Reply ONLY with JSON, no fences: '
                         f'{{"caption":"one sentence",'
                         f'"category":"people/landscape/food/document/animal/architecture/event/other",'
@@ -1076,6 +1208,8 @@ def stage_vision(photos: List[Photo], db: DB,
                 else:
                     # llama3.2-vision ignores JSON instructions, use structured text
                     prompt = (
+                        "Input is a 3-panel composite: LEFT=full scene, MIDDLE=center 1:1 crop, RIGHT=primary-face 1:1 crop (or center fallback).\n"
+                        "Use all panels and rely on MIDDLE/RIGHT for fine texture and sharpness.\n"
                         "Describe this photo in one sentence.\n"
                         "Then on separate lines write:\n"
                         "QUALITY: excellent/good/average/poor\n"
