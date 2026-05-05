@@ -1102,7 +1102,6 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
     # Pre-compute event counts once
     event_counts = Counter(p.event_id for p in photos if p.event_id)
 
-    QUALITY_MAP = {"excellent": 20, "good": 12, "average": 0, "poor": -15}
     LOW_LAPLACIAN_FLOOR = 30.0
     HIGH_ISO_CUTOFF = 1600.0
     FAST_SHUTTER_S = 1.0 / 1000.0
@@ -1171,17 +1170,9 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
         if p.event_id and event_counts[p.event_id] == 1:
             s += 10
 
-        # ── Vision quality (10 pts) ──────────────────────────────────────
-        if p.vision_quality:
-            s += QUALITY_MAP.get(p.vision_quality.lower(), 0)
-
-        # ── Memorability (15 pts, semantic — only from vision) ───────────
-        if p.vision_memorability > 0:
-            s += MEMO_MAP.get(p.vision_memorability, 0)
-
         p.score = max(0, min(100, int(s)))
 
-    # ── Assign decisions ─────────────────────────────────────────────────
+    # ── Assign decisions (Bayesian gate with VLM veto) ─────────────────────
     # Adaptive thresholds: only tighten when vision covered >50% of review band
     review_band = [p for p in photos if not p.decision and VISION_BAND_LOW <= p.score <= VISION_BAND_HIGH]
     vision_count = sum(1 for p in review_band if p.vision_model)
@@ -1191,14 +1182,51 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
     else:
         keep_thresh, remove_thresh = 65, 35
 
+    
+    high_value_categories = {"document", "people"}
+
+    def deterministic_prior(photo: Photo) -> str:
+        """Prior decision from deterministic signals only: blur/BRISQUE/resolution."""
+        d = 50.0
+
+        if photo.blur > 0:
+            blur_ratio = photo.blur / blur_p75
+            if blur_ratio >= 1.5:    d += 25
+            elif blur_ratio >= 1.0:  d += 15
+            elif blur_ratio >= 0.5:  d += 5
+            elif blur_ratio >= 0.2:  d -= 10
+            else:                    d -= 20
+
+        if photo.brisque > 0:
+            if photo.brisque < 15:    d += 15
+            elif photo.brisque < 30:  d += 8
+            elif photo.brisque < 50:  d += 2
+            else:                     d -= 10
+
+        if photo.resolution > 0:
+            if photo.resolution >= 12_000_000:      d += 12
+            elif photo.resolution >= 8_000_000:     d += 8
+            elif photo.resolution >= 2_000_000:     d += 2
+            elif photo.resolution < 1_000_000:      d -= 12
+
+        d = max(0, min(100, int(d)))
+        if d >= keep_thresh:
+            return "KEEP"
+        if d <= remove_thresh:
+            return "REMOVE"
+        return "REVIEW"
+
+
     for p in photos:
         if p.decision:
             continue
 
-        if p.blur > 0 and p.blur < LOW_LAPLACIAN_FLOOR and p.vision_memorability < 4:
-            p.decision = "REMOVE"
-            p.reason = "extremely blurry (absolute floor)"
-        elif p.score >= keep_thresh:
+        prior_decision = deterministic_prior(p)
+
+        if p.blur > 0 and p.blur < LOW_LAPLACIAN_FLOOR:
+            prior_decision = "REMOVE"
+
+        if prior_decision == "KEEP":
             p.decision = "KEEP"
             parts = []
             if p.is_burst_winner:                    parts.append("best in burst")
@@ -1211,7 +1239,7 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
                 parts.append(f"memorable({p.vision_memorability}/5)")
             p.reason = ", ".join(parts) if parts else "high quality score"
 
-        elif p.score <= remove_thresh:
+        elif prior_decision == "REMOVE":
             p.decision = "REMOVE"
             parts = []
             if p.blur > 0 and p.blur < BLUR_THRESH: parts.append("blurry")
@@ -1224,6 +1252,14 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
         else:
             p.decision = "REVIEW"
             p.reason = "ambiguous -- manual review suggested"
+
+        # Bayesian veto gate: semantic value can override weak deterministic prior
+        if p.decision in ("REVIEW", "REMOVE"):
+            category = (p.vision_category or "").strip().lower()
+            quality = (p.vision_quality or "").strip().lower()
+            if quality == "good" and category in high_value_categories:
+                p.decision = "KEEP"
+                p.reason = "VLM Veto: High-value content despite low sharpness"
 
     scored = [p for p in photos if p.score >= 0]
     if scored:
