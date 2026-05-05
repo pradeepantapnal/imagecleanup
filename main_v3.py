@@ -45,6 +45,7 @@ import shutil
 import subprocess
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from time import perf_counter, process_time
+import gc
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime
@@ -87,6 +88,18 @@ except ImportError:
         return it
 
 HAS_CLIP = False
+HAS_NVML = False
+try:
+    from pynvml import (
+        nvmlInit, nvmlShutdown, nvmlDeviceGetHandleByIndex,
+        nvmlDeviceGetUtilizationRates, nvmlDeviceGetMemoryInfo,
+        nvmlDeviceGetPcieThroughput, NVML_PCIE_UTIL_TX_BYTES, NVML_PCIE_UTIL_RX_BYTES,
+        nvmlDeviceGetPowerUsage, nvmlDeviceGetTemperature, NVML_TEMPERATURE_GPU,
+    )
+    HAS_NVML = True
+except Exception:
+    HAS_NVML = False
+
 HAS_FACES = False
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -952,8 +965,114 @@ def stage_burst(photos: List[Photo], db: DB) -> List[Photo]:
     return photos
 
 
+class GPUMonitor:
+    def __init__(self, stage_name: str, enabled: bool = False, gpu_index: int = 0):
+        self.stage_name = stage_name
+        self.enabled = enabled
+        self.gpu_index = gpu_index
+        self.handle = None
+        self.start = None
+        self.samples = []
+
+    def _snapshot(self):
+        if not self.handle:
+            return None
+        try:
+            util = nvmlDeviceGetUtilizationRates(self.handle)
+            mem = nvmlDeviceGetMemoryInfo(self.handle)
+            tx_kbs = nvmlDeviceGetPcieThroughput(self.handle, NVML_PCIE_UTIL_TX_BYTES)
+            rx_kbs = nvmlDeviceGetPcieThroughput(self.handle, NVML_PCIE_UTIL_RX_BYTES)
+            power_w = nvmlDeviceGetPowerUsage(self.handle) / 1000.0
+            temp_c = nvmlDeviceGetTemperature(self.handle, NVML_TEMPERATURE_GPU)
+            return {
+                "gpu_util": float(util.gpu), "mem_util": float(util.memory),
+                "vram_used": int(mem.used), "vram_free": int(mem.free), "vram_total": int(mem.total),
+                "pcie_tx_kbs": float(tx_kbs), "pcie_rx_kbs": float(rx_kbs),
+                "power_w": float(power_w), "temp_c": float(temp_c),
+            }
+        except Exception as e:
+            if self.enabled:
+                log.warning(f"[PERF] [{self.stage_name}] NVML snapshot failed: {type(e).__name__}")
+            return None
+
+    def sample(self):
+        snap = self._snapshot()
+        if snap:
+            self.samples.append(snap)
+        return snap
+
+    def __enter__(self):
+        if not (self.enabled and HAS_NVML):
+            if self.enabled and not HAS_NVML:
+                log.warning(f"[PERF] [{self.stage_name}] NVML unavailable; skipping GPU telemetry")
+            return self
+        try:
+            nvmlInit()
+            self.handle = nvmlDeviceGetHandleByIndex(self.gpu_index)
+            self.start = self._snapshot()
+            if self.start:
+                self.samples.append(self.start)
+        except Exception as e:
+            self.handle = None
+            log.warning(f"[PERF] [{self.stage_name}] NVML init failed: {type(e).__name__}")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if not self.enabled:
+            return False
+        end = self._snapshot() if self.handle else None
+        if end:
+            self.samples.append(end)
+        if self.start and end:
+            delta_vram_mb = (end["vram_used"] - self.start["vram_used"]) / (1024 * 1024)
+            avg_sm = sum(x["gpu_util"] for x in self.samples) / max(1, len(self.samples))
+            peak_tx = max(x["pcie_tx_kbs"] for x in self.samples) / 1024.0
+            peak_rx = max(x["pcie_rx_kbs"] for x in self.samples) / 1024.0
+            log.info(
+                f"[PERF] [{self.stage_name}] Delta_VRAM:{delta_vram_mb:.1f}MB | "
+                f"Avg_SM_Util:{avg_sm:.1f}% | Peak_PCIe_TX:{peak_tx:.1f}MB/s | Peak_PCIe_RX:{peak_rx:.1f}MB/s"
+            )
+        if self.handle:
+            try:
+                nvmlShutdown()
+            except Exception:
+                pass
+        return False
+
+
+def check_gpu_headroom(perf_log: bool = False, min_free_gb: float = 1.0) -> bool:
+    if not HAS_NVML:
+        return True
+    try:
+        nvmlInit()
+        try:
+            h = nvmlDeviceGetHandleByIndex(0)
+            mem = nvmlDeviceGetMemoryInfo(h)
+            free_gb = mem.free / (1024 ** 3)
+            if free_gb < min_free_gb:
+                log.warning(f"[PERF] [STAGE_7] Low GPU headroom: {free_gb:.2f}GB free; running cache cleanup")
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                gc.collect()
+                return False
+            return True
+        finally:
+            try:
+                nvmlShutdown()
+            except Exception:
+                pass
+    except Exception as e:
+        if perf_log:
+            log.warning(f"[PERF] [STAGE_7] GPU headroom check failed: {type(e).__name__}")
+        return True
+
+
 # ── Stage 4: CLIP tagging ─────────────────────────────────────────────────────
-def stage_clip(photos: List[Photo], db: DB) -> List[Photo]:
+def stage_clip(photos: List[Photo], db: DB, perf_log: bool = False) -> List[Photo]:
     try:
         import clip
         import torch
@@ -974,20 +1093,32 @@ def stage_clip(photos: List[Photo], db: DB) -> List[Photo]:
             if p.file_exists and not p.clip_tags and p.resolution > 0 and not (p.error or "").startswith("worker:")
         ]
         log.info(f"S4 CLIP      : {len(valid)} images ({device})")
-        for p in tqdm(valid, desc="S4 CLIP"):
-            try:
-                with Image.open(p.path) as img:
-                    t = preprocess(img.convert("RGB")).unsqueeze(0).to(device)
-                with torch.no_grad():
-                    lp = (100.0 * model.encode_image(t) @ model.encode_text(tokens).T).softmax(dim=-1)
-                probs = lp.cpu().numpy()[0]
-                top = [labels[i] for i in probs.argsort()[-3:][::-1] if probs[i] > 0.2]
-                p.clip_tags = ", ".join(top)
-                p.clip_confidence = float(max(probs))
-                db.save(p)
-            except Exception as e:
-                p.error = f"CLIP:{e}"
-                db.save(p)
+        with GPUMonitor("STAGE_4", enabled=perf_log) as gm:
+            for p in tqdm(valid, desc="S4 CLIP"):
+                try:
+                    with Image.open(p.path) as img:
+                        t = preprocess(img.convert("RGB")).unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        lp = (100.0 * model.encode_image(t) @ model.encode_text(tokens).T).softmax(dim=-1)
+                    probs = lp.cpu().numpy()[0]
+                    top = [labels[i] for i in probs.argsort()[-3:][::-1] if probs[i] > 0.2]
+                    p.clip_tags = ", ".join(top)
+                    p.clip_confidence = float(max(probs))
+                    if perf_log and device == "cuda":
+                        try:
+                            stats = torch.cuda.memory_stats()
+                            reserved = stats.get("reserved_bytes.all.current", 0)
+                            active = stats.get("active_bytes.all.current", 0)
+                            frag_mb = (reserved - active) / (1024 * 1024)
+                            if frag_mb > 500:
+                                log.warning(f"[PERF] [STAGE_4] File: {Path(p.path).name} | VRAM_Fragmentation: {frag_mb:.1f}MB")
+                        except Exception as e:
+                            log.warning(f"[PERF] [STAGE_4] memory_stats failed: {type(e).__name__}")
+                    gm.sample()
+                    db.save(p)
+                except Exception as e:
+                    p.error = f"CLIP:{e}"
+                    db.save(p)
     except Exception as e:
         log.error(f"S4 CLIP failed: {e}")
     return photos
@@ -1281,7 +1412,7 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
 
 # ── Stage 7: Vision LLM (selective, score band 35-65) ─────────────────────────
 def stage_vision(photos: List[Photo], db: DB,
-                 primary: str, fallback: str, limit: int) -> List[Photo]:
+                 primary: str, fallback: str, limit: int, perf_log: bool = False) -> List[Photo]:
     candidates = [p for p in photos
                   if p.file_exists and not p.vision_model
                   and VISION_BAND_LOW <= p.score <= VISION_BAND_HIGH][:limit]
@@ -1302,7 +1433,10 @@ def stage_vision(photos: List[Photo], db: DB,
     api_cpu_total = 0.0
 
     for p in tqdm(candidates, desc="S7 vision"):
+        check_gpu_headroom(perf_log=perf_log)
+        encode_tick = perf_counter()
         b64 = to_b64(Path(p.path), max_size=(512, 512), face_bbox=p.primary_face_bbox)
+        encode_secs = perf_counter() - encode_tick
         if not b64:
             continue
 
@@ -1348,6 +1482,10 @@ def stage_vision(photos: List[Photo], db: DB,
 
                 api_wall_tick = perf_counter()
                 api_cpu_tick = process_time()
+                pre_bus = None
+                mon = GPUMonitor("STAGE_7", enabled=perf_log)
+                mon.__enter__()
+                pre_bus = mon._snapshot()
                 resp = requests.post(OLLAMA_URL, json={
                     "model": model, "prompt": prompt,
                     "images": [b64], "stream": False,
@@ -1356,7 +1494,10 @@ def stage_vision(photos: List[Photo], db: DB,
                 resp.raise_for_status()
                 api_wall_total += perf_counter() - api_wall_tick
                 api_cpu_total += process_time() - api_cpu_tick
-                raw = resp.json().get("response", "").strip()
+                resp_json = resp.json()
+                raw = resp_json.get("response", "").strip()
+                post_bus = mon._snapshot()
+                mon.__exit__(None, None, None)
 
                 if "llava" in model:
                     data = parse_json(raw)
@@ -1386,6 +1527,22 @@ def stage_vision(photos: List[Photo], db: DB,
                         except (ValueError, TypeError):
                             p.vision_memorability = 0
 
+                if perf_log:
+                    b64_mb = len(b64.encode("utf-8")) / (1024 * 1024)
+                    tx0 = (pre_bus or {}).get("pcie_tx_kbs", 0.0) / 1024.0
+                    tx1 = (post_bus or {}).get("pcie_tx_kbs", 0.0) / 1024.0
+                    bus_tx = max(tx0, tx1)
+                    vram_gb = ((post_bus or {}).get("vram_used", 0.0)) / (1024 ** 3)
+                    td = resp_json.get("total_duration", 0) / 1e6
+                    ld = resp_json.get("load_duration", 0) / 1e6
+                    ped = resp_json.get("prompt_eval_duration", 0) / 1e6
+                    ed = resp_json.get("eval_duration", 0) / 1e6
+                    log.info(
+                        f"[PERF] [STAGE_7] File: {Path(p.path).name} | Bus_TX: {bus_tx:.1f}MB/s | "
+                        f"Base64_Size: {b64_mb:.2f}MB | Encode_Ship: {encode_secs*1000:.1f}ms | "
+                        f"VRAM_Used: {vram_gb:.2f}GB | Ollama_Total: {td:.1f}ms | "
+                        f"Ollama_Load: {ld:.1f}ms | Ollama_Prompt: {ped:.1f}ms | Ollama_Eval: {ed:.1f}ms"
+                    )
                 p.vision_model = model
                 db.save(p)
                 successes += 1
@@ -1743,6 +1900,8 @@ def main():
                         help="Preview score distribution, write no files")
     parser.add_argument("--clear-cache", action="store_true", default=None,
                         help="Wipe cached results before running")
+    parser.add_argument("--perf-log", action="store_true",
+                        help="Enable high-fidelity GPU performance instrumentation")
     args = parser.parse_args()
     config = _read_config(args.config)
     args = _apply_config_defaults(args, config)
@@ -1810,7 +1969,7 @@ def main():
         with stage_timer("S3 burst detection"):
             photos = stage_burst(photos, db)
         with stage_timer("S4 CLIP tagging"):
-            photos = stage_clip(photos, db)
+            photos = stage_clip(photos, db, perf_log=args.perf_log)
         with stage_timer("S5 event grouping"):
             photos = stage_events(photos, db)
         if args.enable_faces:
@@ -1825,7 +1984,7 @@ def main():
             with stage_timer("S7 vision analysis"):
                 photos = stage_vision(photos, db,
                                       args.vision_model, args.vision_fallback,
-                                      args.vision_limit)
+                                      args.vision_limit, perf_log=args.perf_log)
 
         if args.dry_run:
             with stage_timer("Dry-run summary"):
