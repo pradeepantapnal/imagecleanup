@@ -203,6 +203,8 @@ class Photo:
     width: int = 0
     height: int = 0
     label: str = ""
+    iso_speed: float = 0.0
+    exposure_time_s: float = 0.0
     # Hashes
     md5: str = ""
     phash: str = ""
@@ -747,6 +749,28 @@ def _match_metrics_row(img: Path, folder: str, metrics: Dict[str, dict]) -> Opti
     return by_filename.get(img.name.lower())
 
 
+
+
+def _exif_num(v) -> float:
+    try:
+        if isinstance(v, tuple) and len(v) == 2 and v[1]:
+            return float(v[0]) / float(v[1])
+        return float(v)
+    except Exception:
+        return 0.0
+
+
+def _extract_sensor_state(pil_img) -> tuple[float, float]:
+    iso_speed = 0.0
+    exposure_time_s = 0.0
+    try:
+        exif = pil_img.getexif()
+        iso_speed = _exif_num(exif.get(34855, 0))  # ISOSpeedRatings
+        exposure_time_s = _exif_num(exif.get(33434, 0))  # ExposureTime
+    except Exception:
+        pass
+    return iso_speed, exposure_time_s
+
 def compute_photo_metrics_worker(path_str: str, ck: str) -> dict:
     img = Path(path_str)
     out = {
@@ -758,6 +782,7 @@ def compute_photo_metrics_worker(path_str: str, ck: str) -> dict:
         "width": 0, "height": 0, "resolution": 0.0,
         "colorfulness": 0.0, "brightness": 0.0, "contrast": 0.0,
         "blur": 0.0, "brisque": 0.0, "composite_score": 0.0, "label": "",
+        "iso_speed": 0.0, "exposure_time_s": 0.0,
         "error": "",
     }
     try:
@@ -772,6 +797,7 @@ def compute_photo_metrics_worker(path_str: str, ck: str) -> dict:
             out["width"], out["height"] = pil_img.size
             out["resolution"] = float(out["width"] * out["height"])
             out["colorfulness"] = round(compute_colorfulness(rgb), 2)
+            out["iso_speed"], out["exposure_time_s"] = _extract_sensor_state(pil_img)
             brt, ctr = compute_brightness_contrast(rgb)
             out["brightness"] = round(brt, 2)
             out["contrast"] = round(ctr, 2)
@@ -1077,6 +1103,9 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
     event_counts = Counter(p.event_id for p in photos if p.event_id)
 
     QUALITY_MAP = {"excellent": 20, "good": 12, "average": 0, "poor": -15}
+    LOW_LAPLACIAN_FLOOR = 30.0
+    HIGH_ISO_CUTOFF = 1600.0
+    FAST_SHUTTER_S = 1.0 / 1000.0
     LABEL_MAP   = {"GOOD": 10, "AVERAGE": 0, "POOR": -10}
 
     # Memorability: 1=mundane, 2=ordinary, 3=decent, 4=memorable, 5=exceptional
@@ -1100,6 +1129,10 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
             continue
 
         # ── Blur: relative to folder p75 (25 pts) ────────────────────────
+        blur_good_floor = 300.0
+        if 0 < p.exposure_time_s < FAST_SHUTTER_S:
+            blur_good_floor = 220.0
+
         if p.blur > 0:
             ratio = p.blur / blur_p75
             if ratio >= 1.5:    s += 25
@@ -1110,10 +1143,11 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
 
         # ── BRISQUE: absolute, lower is better (15 pts) ──────────────────
         if p.brisque > 0:
+            noise_penalty_scale = 0.6 if p.iso_speed > HIGH_ISO_CUTOFF else 1.0
             if p.brisque < 15:    s += 15
             elif p.brisque < 30:  s += 8
             elif p.brisque < 50:  s += 2
-            else:                 s -= 10
+            else:                 s -= 10 * noise_penalty_scale
 
         # ── Composite: relative to folder p75 (15 pts) ───────────────────
         if p.composite_score > 0:
@@ -1124,7 +1158,10 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
             else:               s -= 5
 
         # ── Label (10 pts) ───────────────────────────────────────────────
-        s += LABEL_MAP.get(p.label.upper() if p.label else "", 0)
+        label_score = LABEL_MAP.get(p.label.upper() if p.label else "", 0)
+        if p.label == "GOOD" and p.blur < blur_good_floor:
+            label_score = 0
+        s += label_score
 
         # ── Burst winner bonus (10 pts) ──────────────────────────────────
         if p.is_burst_winner:
@@ -1158,7 +1195,10 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
         if p.decision:
             continue
 
-        if p.score >= keep_thresh:
+        if p.blur > 0 and p.blur < LOW_LAPLACIAN_FLOOR and p.vision_memorability < 4:
+            p.decision = "REMOVE"
+            p.reason = "extremely blurry (absolute floor)"
+        elif p.score >= keep_thresh:
             p.decision = "KEEP"
             parts = []
             if p.is_burst_winner:                    parts.append("best in burst")
