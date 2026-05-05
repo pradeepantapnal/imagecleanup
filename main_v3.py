@@ -531,14 +531,54 @@ def get_ts(path: Path) -> datetime:
     return exif_ts(path) or filename_ts(path) or datetime.fromtimestamp(path.stat().st_mtime)
 
 
-def to_b64(path: Path, max_size=(800, 800)) -> str:
+def to_b64(path: Path, max_size=(512, 512), face_bbox: str = "") -> str:
     try:
         resample = getattr(Image, 'LANCZOS', Image.Resampling.LANCZOS)
         with Image.open(path) as img:
             img = img.convert("RGB")
-            img.thumbnail(max_size, resample)
+            w, h = img.size
+            side = min(w, h)
+
+            # LEFT tile: full-scene thumbnail for composition context
+            left_tile = img.copy()
+            left_tile.thumbnail(max_size, resample)
+            left_canvas = Image.new("RGB", max_size, "black")
+            left_canvas.paste(
+                left_tile,
+                ((max_size[0] - left_tile.width) // 2, (max_size[1] - left_tile.height) // 2)
+            )
+
+            # RIGHT tile: 1:1 native-detail center crop (300x300)
+            center_crop = _safe_square_crop(img, w // 2, h // 2, side).resize((300, 300), resample)
+
+            # Optional BOTTOM tile: primary face detail crop (300x300)
+            face_tile = None
+            if face_bbox:
+                try:
+                    t, r, b, l = [int(v) for v in face_bbox.split(",")]
+                    fw = max(1, r - l)
+                    fh = max(1, b - t)
+                    fside = max(fw, fh) * 2
+                    cx = l + fw // 2
+                    cy = t + fh // 2
+                    face_tile = _safe_square_crop(img, cx, cy, fside).resize((300, 300), resample)
+                except Exception:
+                    face_tile = None
+
+            right_col_h = 600 if face_tile is not None else 300
+            composite_h = max(max_size[1], right_col_h)
+            composite = Image.new("RGB", (max_size[0] + 300, composite_h), "black")
+
+            # Place left tile centered vertically.
+            composite.paste(left_canvas, (0, (composite_h - max_size[1]) // 2))
+            # Place right-side center detail tile.
+            composite.paste(center_crop, (max_size[0], 0))
+            # Place optional face tile on bottom-right.
+            if face_tile is not None:
+                composite.paste(face_tile, (max_size[0], 300))
+
             buf = BytesIO()
-            img.save(buf, format="JPEG", quality=80)
+            composite.save(buf, format="JPEG", quality=88)
             return base64.b64encode(buf.getvalue()).decode()
     except Exception:
         return ""
@@ -1177,7 +1217,7 @@ def stage_vision(photos: List[Photo], db: DB,
     api_cpu_total = 0.0
 
     for p in tqdm(candidates, desc="S7 vision"):
-        b64 = vision_multi_patch_b64(Path(p.path), p.primary_face_bbox)
+        b64 = to_b64(Path(p.path), max_size=(512, 512), face_bbox=p.primary_face_bbox)
         if not b64:
             continue
 
@@ -1189,8 +1229,10 @@ def stage_vision(photos: List[Photo], db: DB,
                     prompt = (
                         f'Analyze this photo. Blur={p.blur:.0f}, '
                         f'brisque={p.brisque:.0f}, composite={p.composite_score:.0f}. '
-                        f'Input is a 3-panel composite: LEFT=full scene, MIDDLE=center 1:1 crop, RIGHT=primary-face 1:1 crop (or center fallback). '
-                        f'Use all panels, especially MIDDLE/RIGHT for fine texture and sharpness judgments. '
+                        f'Input is a foveated composite: LEFT=full-scene thumbnail (composition context), '
+                        f'RIGHT TOP=300x300 center-detail tile at native resolution, '
+                        f'RIGHT BOTTOM=300x300 primary-face detail tile when present. '
+                        f'Judge focus and noise primarily from the RIGHT detail tile(s); use LEFT for composition context. '
                         f'Reply ONLY with JSON, no fences: '
                         f'{{"caption":"one sentence",'
                         f'"category":"people/landscape/food/document/animal/architecture/event/other",'
@@ -1208,8 +1250,9 @@ def stage_vision(photos: List[Photo], db: DB,
                 else:
                     # llama3.2-vision ignores JSON instructions, use structured text
                     prompt = (
-                        "Input is a 3-panel composite: LEFT=full scene, MIDDLE=center 1:1 crop, RIGHT=primary-face 1:1 crop (or center fallback).\n"
-                        "Use all panels and rely on MIDDLE/RIGHT for fine texture and sharpness.\n"
+                        "Input is a foveated composite: LEFT=full-scene thumbnail, RIGHT TOP=center 300x300 detail tile, "
+                        "RIGHT BOTTOM=primary-face 300x300 detail tile when present.\n"
+                        "Judge focus and noise primarily from RIGHT detail tile(s); use LEFT for composition context.\n"
                         "Describe this photo in one sentence.\n"
                         "Then on separate lines write:\n"
                         "QUALITY: excellent/good/average/poor\n"
