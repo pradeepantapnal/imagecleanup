@@ -1099,7 +1099,6 @@ def thermal_guard(perf_log: bool = False, threshold_c: float = 75.0, cooldown_se
 # ── Stage 4: CLIP tagging ─────────────────────────────────────────────────────
 def stage_clip(photos: List[Photo], db: DB, perf_log: bool = False) -> List[Photo]:
     try:
-        import torch
         import openvino as ov
         from optimum.intel.openvino import OVModelForZeroShotImageClassification
         from transformers import AutoProcessor
