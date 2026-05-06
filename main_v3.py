@@ -108,6 +108,8 @@ except Exception:
 
 HAS_FACES = False
 
+OLLAMA_NUM_PARALLEL = 4
+
 # ── Constants ──────────────────────────────────────────────────────────────────
 VERSION          = "3.2"
 SUPPORTED_EXTS   = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif", ".heic"}
@@ -1881,7 +1883,7 @@ def main():
     args = _apply_config_defaults(args, config)
 
     if args.enable_vision:
-        num_parallel = int(os.environ.get("OLLAMA_NUM_PARALLEL", "0") or "0")
+        num_parallel = OLLAMA_NUM_PARALLEL
         if num_parallel < 4:
             raise RuntimeError("OLLAMA_NUM_PARALLEL must be set to at least 4 for concurrent vision inference.")
 
