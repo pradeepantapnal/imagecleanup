@@ -1309,6 +1309,22 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
 
     
     high_value_categories = {"document", "people"}
+    high_value_category_terms = {
+        "people", "person", "portrait", "selfie", "group", "crowd", "family", "friends",
+        "wedding", "party", "celebration", "ceremony", "event", "graduation", "birthday",
+        "document", "receipt", "invoice", "id", "passport", "license", "card", "paper", "form",
+    }
+
+    def is_high_value_category(category: str) -> bool:
+        normalized = " ".join((category or "").strip().lower().replace("_", " ").replace("-", " ").split())
+        if not normalized:
+            return False
+        if normalized in high_value_categories:
+            return True
+        tokens = set(normalized.split())
+        if tokens & high_value_category_terms:
+            return True
+        return any(term in normalized for term in ("person", "people", "document", "receipt", "passport", "event"))
 
     def deterministic_prior(photo: Photo) -> str:
         """Prior decision from deterministic signals only: blur/BRISQUE/resolution."""
@@ -1387,7 +1403,7 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
         elif quality == "excellent":
             p.decision = "KEEP"
             p.reason = "VLM Veto: excellent quality override"
-        elif p.decision in ("REVIEW", "REMOVE") and quality == "good" and category in high_value_categories:
+        elif p.decision in ("REVIEW", "REMOVE") and quality == "good" and is_high_value_category(category):
             p.decision = "KEEP"
             p.reason = "VLM Veto: High-value content despite low sharpness"
 
@@ -1449,7 +1465,7 @@ def stage_vision(photos: List[Photo], db: DB,
                                 "{\n"
                                 '"quality": "excellent" | "good" | "average" | "poor",\n'
                                 '"memorability": 1-5,\n'
-                                '"category": "string"\n'
+                                '"category": "string (use concise labels like people, portrait, group, family, event, document, receipt, passport, scene)"\n'
                                 "}"
                             )
                             api_wall_tick = perf_counter()
