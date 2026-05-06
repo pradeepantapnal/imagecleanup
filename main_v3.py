@@ -1100,16 +1100,22 @@ def thermal_guard(perf_log: bool = False, threshold_c: float = 75.0, cooldown_se
 def stage_clip(photos: List[Photo], db: DB, perf_log: bool = False) -> List[Photo]:
     try:
         import torch
+        import openvino as ov
         from optimum.intel.openvino import OVModelForZeroShotImageClassification
         from transformers import AutoProcessor
-    except ImportError:
-        log.info("S4 CLIP      : skipped (not installed)")
+    except ImportError as e:
+        log.warning(f"S4 CLIP      : skipped ({e})")
         return photos
 
     model = None
     try:
         ov_config = {"CACHE_DIR": "./cache"}
-        device = "NPU"
+        core = ov.Core()
+        available_devices = list(core.available_devices)
+        log.info(f"S4 CLIP      : OpenVINO devices={available_devices}")
+        device = "NPU" if "NPU" in available_devices else "CPU"
+        if "NPU" not in available_devices:
+            log.warning("NPU not detected by OpenVINO runtime")
         model_id = "openai/clip-vit-base-patch32"
         processor = AutoProcessor.from_pretrained(model_id)
         model = OVModelForZeroShotImageClassification.from_pretrained(
@@ -1118,6 +1124,8 @@ def stage_clip(photos: List[Photo], db: DB, perf_log: bool = False) -> List[Phot
             device=device,
             ov_config=ov_config,
         )
+        if "NPU" in available_devices:
+            model.model = core.compile_model(model.model, "NPU")
         categories = ["indoor", "outdoor", "daytime", "nighttime", "people", "landscape",
                       "document", "food", "animal", "architecture", "screenshot", "event"]
         labels = ["indoor", "outdoor", "day", "night", "people", "landscape",
@@ -1268,6 +1276,7 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
     blurs = sorted([p.blur for p in photos if p.blur > 0])
     composites = sorted([p.composite_score for p in photos if p.composite_score > 0])
     blur_p75 = blurs[int(len(blurs) * 0.75)] if blurs else 200.0
+    blur_p25 = blurs[int(len(blurs) * 0.25)] if blurs else 0.0
     comp_p75 = composites[int(len(composites) * 0.75)] if composites else 50000.0
 
     # Pre-compute event counts once
@@ -1354,7 +1363,7 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
         keep_thresh, remove_thresh = 65, 35
 
     
-    high_value_categories = {"document", "people"}
+    high_value_categories = {"document", "people", "architecture", "landscape"}
     high_value_category_terms = {
         "people", "person", "portrait", "selfie", "group", "crowd", "family", "friends",
         "wedding", "party", "celebration", "ceremony", "event", "graduation", "birthday",
@@ -1409,9 +1418,14 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
             continue
 
         prior_decision = deterministic_prior(p)
+        quality = (p.vision_quality or "").strip().lower()
+        category = (p.vision_category or "").strip().lower()
 
         if p.blur > 0 and p.blur < LOW_LAPLACIAN_FLOOR:
             prior_decision = "REMOVE"
+
+        if prior_decision == "REVIEW" and quality == "good" and p.vision_memorability > 3:
+            prior_decision = "KEEP"
 
         if prior_decision == "KEEP":
             p.decision = "KEEP"
@@ -1441,8 +1455,10 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
             p.reason = "ambiguous -- manual review suggested"
 
         # Bayesian veto gate: VLM quality can aggressively override borderline outcomes.
-        category = (p.vision_category or "").strip().lower()
-        quality = (p.vision_quality or "").strip().lower()
+        if quality == "average" and p.blur > 0 and p.blur < blur_p25:
+            p.decision = "REMOVE"
+            p.reason = "Aggressive cull: average quality + bottom-quartile sharpness"
+            continue
         if quality == "poor" and p.decision in ("REVIEW", "REMOVE"):
             p.decision = "REMOVE"
             p.reason = "VLM Veto: poor quality confirmed"
