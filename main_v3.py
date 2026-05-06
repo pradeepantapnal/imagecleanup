@@ -1145,15 +1145,25 @@ def stage_clip(photos: List[Photo], db: DB, perf_log: bool = False) -> List[Phot
         if "NPU" not in available_devices:
             log.warning("NPU not detected by OpenVINO runtime")
         model_id = "openai/clip-vit-base-patch32"
-        processor = AutoProcessor.from_pretrained(model_id)
+        processor = AutoProcessor.from_pretrained(model_id, use_fast=True)
+
+        # Security-first loading: prefer safetensors over legacy torch.load pickle paths.
+        try:
+            from transformers.models.clip.configuration_clip import CLIPConfig
+            torch.serialization.add_safe_globals([CLIPConfig])
+        except Exception:
+            pass
+
         model = OVModelForZeroShotImageClassification.from_pretrained(
             model_id,
             export=True,
             device=device,
             ov_config=ov_config,
+            use_safetensors=True,
         )
         if "NPU" in available_devices:
             model.model = core.compile_model(model.model, "NPU")
+            log.info("[PERF] [STAGE_4] NPU_Model_Compiled=True")
         categories = ["indoor", "outdoor", "daytime", "nighttime", "people", "landscape",
                       "document", "food", "animal", "architecture", "screenshot", "event"]
         labels = ["indoor", "outdoor", "day", "night", "people", "landscape",
