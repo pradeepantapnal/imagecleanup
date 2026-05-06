@@ -547,49 +547,28 @@ def get_ts(path: Path) -> datetime:
 
 def to_b64(path: Path, max_size=(512, 512), face_bbox: str = "") -> str:
     try:
-        resample = getattr(Image, 'LANCZOS', Image.Resampling.LANCZOS)
+        resample = getattr(Image, "LANCZOS", Image.Resampling.LANCZOS)
         with Image.open(path) as img:
             img = img.convert("RGB")
             w, h = img.size
             side = min(w, h)
 
-            # LEFT tile: full-scene thumbnail for composition context
+            # 2-panel horizontal strip
+            # LEFT (50%): full-scene thumbnail
             left_tile = img.copy()
             left_tile.thumbnail(max_size, resample)
             left_canvas = Image.new("RGB", max_size, "black")
             left_canvas.paste(
                 left_tile,
-                ((max_size[0] - left_tile.width) // 2, (max_size[1] - left_tile.height) // 2)
+                ((max_size[0] - left_tile.width) // 2, (max_size[1] - left_tile.height) // 2),
             )
 
-            # RIGHT tile: 1:1 native-detail center crop (300x300)
-            center_crop = _safe_square_crop(img, w // 2, h // 2, side).resize((300, 300), resample)
+            # RIGHT (50%): 1:1 native detail center crop
+            right_tile = _safe_square_crop(img, w // 2, h // 2, side).resize(max_size, resample)
 
-            # Optional BOTTOM tile: primary face detail crop (300x300)
-            face_tile = None
-            if face_bbox:
-                try:
-                    t, r, b, l = [int(v) for v in face_bbox.split(",")]
-                    fw = max(1, r - l)
-                    fh = max(1, b - t)
-                    fside = max(fw, fh) * 2
-                    cx = l + fw // 2
-                    cy = t + fh // 2
-                    face_tile = _safe_square_crop(img, cx, cy, fside).resize((300, 300), resample)
-                except Exception:
-                    face_tile = None
-
-            right_col_h = 600 if face_tile is not None else 300
-            composite_h = max(max_size[1], right_col_h)
-            composite = Image.new("RGB", (max_size[0] + 300, composite_h), "black")
-
-            # Place left tile centered vertically.
-            composite.paste(left_canvas, (0, (composite_h - max_size[1]) // 2))
-            # Place right-side center detail tile.
-            composite.paste(center_crop, (max_size[0], 0))
-            # Place optional face tile on bottom-right.
-            if face_tile is not None:
-                composite.paste(face_tile, (max_size[0], 300))
+            composite = Image.new("RGB", (max_size[0] * 2, max_size[1]), "black")
+            composite.paste(left_canvas, (0, 0))
+            composite.paste(right_tile, (max_size[0], 0))
 
             buf = BytesIO()
             composite.save(buf, format="JPEG", quality=88)
@@ -666,10 +645,13 @@ def parse_json(raw: str) -> dict:
     try:
         return json.loads(raw)
     except Exception:
-        m = re.search(r'\{.*\}', raw, re.DOTALL)
+        # Recovery mode: extract everything from the first "{" to the last "}"
+        # so prose prefixes/suffixes do not waste an inference.
+        m = re.search(r'\{[\s\S]*\}', raw)
         if m:
+            candidate = m.group(0)
             try:
-                return json.loads(m.group())
+                return json.loads(candidate)
             except Exception:
                 pass
     raise ValueError(f"Cannot parse JSON: {raw[:100]}")
@@ -1460,11 +1442,15 @@ def stage_vision(photos: List[Photo], db: DB,
                         attempts += 1
                         try:
                             prompt = (
-                                f"Blur={p.blur:.0f} brisque={p.brisque:.0f} composite={p.composite_score:.0f}. "
-                                "Foveated image: LEFT scene context; RIGHT detail tiles for focus/noise. "
-                                "Technical Audit Only. No conversational preamble. Output JSON and stop immediately. "
-                                '{"caption":"one sentence","category":"people/landscape/food/document/animal/architecture/event/other",'
-                                '"quality":"excellent/good/average/poor","memorability":1,"keep_reason":"...","delete_reason":"..."}'
+                                "TASK: TECHNICAL PHOTO AUDIT.\n"
+                                "INPUT: 2-PANEL STRIP (LEFT=SCENE, RIGHT=PIXEL_DETAIL).\n"
+                                "INSTRUCTION: IGNORE LEFT PANEL COMPOSITION. EVALUATE RIGHT PANEL FOR OPTICAL BLUR AND SENSOR NOISE ONLY.\n"
+                                "OUTPUT: VALID JSON ONLY. NO PREAMBLE. NO EXPLANATION.\n"
+                                "{\n"
+                                '"quality": "excellent" | "good" | "average" | "poor",\n'
+                                '"memorability": 1-5,\n'
+                                '"category": "string"\n'
+                                "}"
                             )
                             api_wall_tick = perf_counter()
                             api_cpu_tick = process_time()
@@ -1474,7 +1460,7 @@ def stage_vision(photos: List[Photo], db: DB,
                             async with session.post(OLLAMA_URL, json={
                                 "model": model, "prompt": prompt,
                                 "images": [b64], "stream": False,
-                                "options": {"temperature": 0.1, "num_predict": 220}
+                                "options": {"temperature": 0.1, "num_predict": 220, "max_tokens": 50}
                             }) as resp:
                                 resp.raise_for_status()
                                 resp_json = await resp.json()
