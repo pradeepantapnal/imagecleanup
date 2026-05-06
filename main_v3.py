@@ -1123,9 +1123,8 @@ def stage_clip(photos: List[Photo], db: DB, perf_log: bool = False) -> List[Phot
         return photos
 
     try:
-        import openvino as ov
-        from optimum.intel.openvino import OVModelForZeroShotImageClassification
-        from transformers import AutoProcessor
+        import clip
+        import torch
     except (ImportError, RuntimeError) as e:
         log.warning(
             "S4 CLIP      : skipped (%s). This commonly indicates incompatible torch/torchvision builds; "
@@ -1136,62 +1135,56 @@ def stage_clip(photos: List[Photo], db: DB, perf_log: bool = False) -> List[Phot
 
     model = None
     try:
-        ov_config = {"CACHE_DIR": "./cache"}
-        core = ov.Core()
-        print(f"Available Devices: {ov.Core().available_devices}")
-        available_devices = list(core.available_devices)
-        log.info(f"S4 CLIP      : OpenVINO devices={available_devices}")
-        device = "NPU" if "NPU" in available_devices else "CPU"
-        if "NPU" not in available_devices:
-            log.warning("NPU not detected by OpenVINO runtime")
-        model_id = "openai/clip-vit-base-patch32"
-        processor = AutoProcessor.from_pretrained(model_id, use_fast=True)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device != "cuda":
+            log.warning("S4 CLIP      : CUDA unavailable; falling back to CPU")
 
-        # Security-first loading: prefer safetensors over legacy torch.load pickle paths.
         try:
-            from transformers.models.clip.configuration_clip import CLIPConfig
-            torch.serialization.add_safe_globals([CLIPConfig])
-        except Exception:
-            pass
+            model, preprocess = clip.load("ViT-B/32", device=device)
+        except Exception as load_err:
+            log.warning(f"S4 CLIP      : initial clip.load failed ({type(load_err).__name__}); retrying with torch.load(weights_only=False)")
+            _orig_torch_load = torch.load
 
-        model = OVModelForZeroShotImageClassification.from_pretrained(
-            model_id,
-            export=True,
-            device=device,
-            ov_config=ov_config,
-            use_safetensors=True,
-        )
-        if "NPU" in available_devices:
-            model.model = core.compile_model(model.model, "NPU")
-            log.info("[PERF] [STAGE_4] NPU_Model_Compiled=True")
+            def _torch_load_weights_off(*args, **kwargs):
+                kwargs["weights_only"] = False
+                return _orig_torch_load(*args, **kwargs)
+
+            torch.load = _torch_load_weights_off
+            try:
+                model, preprocess = clip.load("ViT-B/32", device=device)
+            finally:
+                torch.load = _orig_torch_load
+
         categories = ["indoor", "outdoor", "daytime", "nighttime", "people", "landscape",
                       "document", "food", "animal", "architecture", "screenshot", "event"]
         labels = ["indoor", "outdoor", "day", "night", "people", "landscape",
                   "document", "food", "animal", "architecture", "screenshot", "event"]
+        text = clip.tokenize([f"a photo of {c}" for c in categories]).to(device)
+
         valid = [
             p for p in photos
             if p.file_exists and not p.clip_tags and p.resolution > 0 and not (p.error or "").startswith("worker:")
         ]
-        log.info(f"S4 CLIP      : {len(valid)} images ({device})")
+        log.info(f"S4 CLIP      : {len(valid)} images ({device.upper()})")
         with GPUMonitor("STAGE_4", enabled=perf_log) as gm:
+            with torch.no_grad():
+                text_features = model.encode_text(text)
+                text_features /= text_features.norm(dim=-1, keepdim=True)
+
             for p in tqdm(valid, desc="S4 CLIP"):
                 try:
                     with Image.open(p.path) as img:
-                        rgb = img.convert("RGB")
+                        image = preprocess(img.convert("RGB")).unsqueeze(0).to(device)
                     with torch.no_grad():
-                        inputs = processor(
-                            text=[f"a photo of {c}" for c in categories],
-                            images=rgb,
-                            return_tensors="pt",
-                            padding=True,
-                        )
-                        out = model(**inputs)
-                    probs = out.logits_per_image.softmax(dim=-1).cpu().numpy()[0]
+                        image_features = model.encode_image(image)
+                        image_features /= image_features.norm(dim=-1, keepdim=True)
+                        logits = (100.0 * image_features @ text_features.T).softmax(dim=-1)
+                    probs = logits[0].detach().cpu().numpy()
                     top = [labels[i] for i in probs.argsort()[-3:][::-1] if probs[i] > 0.2]
                     p.clip_tags = ", ".join(top)
                     p.clip_confidence = float(max(probs))
                     if perf_log:
-                        log.info(f"[PERF] [STAGE_4] File: {Path(p.path).name} | Backend: NPU")
+                        log.info(f"[PERF] [STAGE_4] File: {Path(p.path).name} | Backend: {device.upper()}")
                     gm.sample()
                     db.save(p)
                 except Exception as e:
@@ -1203,6 +1196,8 @@ def stage_clip(photos: List[Photo], db: DB, perf_log: bool = False) -> List[Phot
         if model is not None:
             del model
         gc.collect()
+        if 'torch' in locals() and torch.cuda.is_available():
+            torch.cuda.empty_cache()
     return photos
 
 
@@ -1558,6 +1553,7 @@ def stage_vision(photos: List[Photo], db: DB,
                         attempts += 1
                         try:
                             prompt = (
+                                "ROLE: You are a strict compliance auditor that must return valid JSON only.\n"
                                 "TASK: TECHNICAL PHOTO AUDIT.\n"
                                 "INPUT: 2-PANEL STRIP (LEFT=SCENE, RIGHT=PIXEL_DETAIL).\n"
                                 "INSTRUCTION: IGNORE LEFT PANEL COMPOSITION. EVALUATE RIGHT PANEL FOR OPTICAL BLUR AND SENSOR NOISE ONLY.\n"
@@ -2053,6 +2049,13 @@ def main():
             photos = stage_burst(photos, db)
         with stage_timer("S4 CLIP tagging"):
             photos = stage_clip(photos, db, perf_log=args.perf_log)
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
         with stage_timer("S5 event grouping"):
             photos = stage_events(photos, db)
         if args.enable_faces:
