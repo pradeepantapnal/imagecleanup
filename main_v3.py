@@ -1111,6 +1111,7 @@ def stage_clip(photos: List[Photo], db: DB, perf_log: bool = False) -> List[Phot
     try:
         ov_config = {"CACHE_DIR": "./cache"}
         core = ov.Core()
+        print(f"Available Devices: {ov.Core().available_devices}")
         available_devices = list(core.available_devices)
         log.info(f"S4 CLIP      : OpenVINO devices={available_devices}")
         device = "NPU" if "NPU" in available_devices else "CPU"
