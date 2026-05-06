@@ -1061,23 +1061,67 @@ def check_gpu_headroom(perf_log: bool = False, min_free_gb: float = 1.0) -> bool
         return True
 
 
+def thermal_guard(perf_log: bool = False, threshold_c: float = 75.0, cooldown_seconds: int = 10) -> None:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    if not perf_log:
+        return
+    if not HAS_NVML:
+        log.warning("[PERF] [THERMAL_GUARD] NVML unavailable; skipping temperature check")
+        return
+    try:
+        nvmlInit()
+        try:
+            h = nvmlDeviceGetHandleByIndex(0)
+            temp_c = float(nvmlDeviceGetTemperature(h, NVML_TEMPERATURE_GPU))
+            log.info(f"[PERF] [THERMAL_GUARD] GPU_Temp:{temp_c:.1f}C")
+            if temp_c > threshold_c:
+                log.warning(
+                    f"[PERF] [THERMAL_GUARD] GPU temperature above {threshold_c:.1f}C; "
+                    f"cooling for {cooldown_seconds}s before Stage 7"
+                )
+                import time
+                time.sleep(cooldown_seconds)
+        finally:
+            try:
+                nvmlShutdown()
+            except Exception:
+                pass
+    except Exception as e:
+        log.warning(f"[PERF] [THERMAL_GUARD] Temperature check failed: {type(e).__name__}")
+
+
 # ── Stage 4: CLIP tagging ─────────────────────────────────────────────────────
 def stage_clip(photos: List[Photo], db: DB, perf_log: bool = False) -> List[Photo]:
     try:
-        import clip
         import torch
+        from optimum.intel.openvino import OVModelForZeroShotImageClassification
+        from transformers import AutoProcessor
     except ImportError:
         log.info("S4 CLIP      : skipped (not installed)")
         return photos
 
+    model = None
     try:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model, preprocess = clip.load("ViT-B/32", device=device)
+        ov_config = {"CACHE_DIR": "./cache"}
+        device = "NPU"
+        model_id = "openai/clip-vit-base-patch32"
+        processor = AutoProcessor.from_pretrained(model_id)
+        model = OVModelForZeroShotImageClassification.from_pretrained(
+            model_id,
+            export=True,
+            device=device,
+            ov_config=ov_config,
+        )
         categories = ["indoor", "outdoor", "daytime", "nighttime", "people", "landscape",
                       "document", "food", "animal", "architecture", "screenshot", "event"]
         labels = ["indoor", "outdoor", "day", "night", "people", "landscape",
                   "document", "food", "animal", "architecture", "screenshot", "event"]
-        tokens = clip.tokenize([f"a photo of {c}" for c in categories]).to(device)
         valid = [
             p for p in photos
             if p.file_exists and not p.clip_tags and p.resolution > 0 and not (p.error or "").startswith("worker:")
@@ -1087,23 +1131,21 @@ def stage_clip(photos: List[Photo], db: DB, perf_log: bool = False) -> List[Phot
             for p in tqdm(valid, desc="S4 CLIP"):
                 try:
                     with Image.open(p.path) as img:
-                        t = preprocess(img.convert("RGB")).unsqueeze(0).to(device)
+                        rgb = img.convert("RGB")
                     with torch.no_grad():
-                        lp = (100.0 * model.encode_image(t) @ model.encode_text(tokens).T).softmax(dim=-1)
-                    probs = lp.cpu().numpy()[0]
+                        inputs = processor(
+                            text=[f"a photo of {c}" for c in categories],
+                            images=rgb,
+                            return_tensors="pt",
+                            padding=True,
+                        )
+                        out = model(**inputs)
+                    probs = out.logits_per_image.softmax(dim=-1).cpu().numpy()[0]
                     top = [labels[i] for i in probs.argsort()[-3:][::-1] if probs[i] > 0.2]
                     p.clip_tags = ", ".join(top)
                     p.clip_confidence = float(max(probs))
-                    if perf_log and device == "cuda":
-                        try:
-                            stats = torch.cuda.memory_stats()
-                            reserved = stats.get("reserved_bytes.all.current", 0)
-                            active = stats.get("active_bytes.all.current", 0)
-                            frag_mb = (reserved - active) / (1024 * 1024)
-                            if frag_mb > 500:
-                                log.warning(f"[PERF] [STAGE_4] File: {Path(p.path).name} | VRAM_Fragmentation: {frag_mb:.1f}MB")
-                        except Exception as e:
-                            log.warning(f"[PERF] [STAGE_4] memory_stats failed: {type(e).__name__}")
+                    if perf_log:
+                        log.info(f"[PERF] [STAGE_4] File: {Path(p.path).name} | Backend: NPU")
                     gm.sample()
                     db.save(p)
                 except Exception as e:
@@ -1111,6 +1153,10 @@ def stage_clip(photos: List[Photo], db: DB, perf_log: bool = False) -> List[Phot
                     db.save(p)
     except Exception as e:
         log.error(f"S4 CLIP failed: {e}")
+    finally:
+        if model is not None:
+            del model
+        gc.collect()
     return photos
 
 
@@ -1964,6 +2010,7 @@ def main():
             photos = compute_scores(photos)
 
         if args.enable_vision:
+            thermal_guard(perf_log=args.perf_log)
             with stage_timer("S7 vision analysis"):
                 photos = stage_vision(photos, db,
                                       args.vision_model, args.vision_fallback,
