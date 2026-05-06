@@ -1103,8 +1103,12 @@ def stage_clip(photos: List[Photo], db: DB, perf_log: bool = False) -> List[Phot
         import openvino as ov
         from optimum.intel.openvino import OVModelForZeroShotImageClassification
         from transformers import AutoProcessor
-    except ImportError as e:
-        log.warning(f"S4 CLIP      : skipped ({e})")
+    except (ImportError, RuntimeError) as e:
+        log.warning(
+            "S4 CLIP      : skipped (%s). This commonly indicates incompatible torch/torchvision builds; "
+            "install matching versions to re-enable CLIP tagging.",
+            e,
+        )
         return photos
 
     model = None
