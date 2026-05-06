@@ -40,6 +40,7 @@ import sqlite3
 import argparse
 import logging
 import requests
+import asyncio
 import platform
 import shutil
 import subprocess
@@ -66,6 +67,11 @@ try:
     from PIL import Image
 except ImportError:
     print("pip install pillow"); sys.exit(1)
+
+try:
+    import aiohttp
+except ImportError:
+    print("pip install aiohttp"); sys.exit(1)
 
 try:
     import imagehash
@@ -1432,140 +1438,107 @@ def stage_vision(photos: List[Photo], db: DB,
     api_wall_total = 0.0
     api_cpu_total = 0.0
 
-    for p in tqdm(candidates, desc="S7 vision"):
-        check_gpu_headroom(perf_log=perf_log)
-        encode_tick = perf_counter()
-        b64 = to_b64(Path(p.path), max_size=(512, 512), face_bbox=p.primary_face_bbox)
-        encode_secs = perf_counter() - encode_tick
-        if not b64:
-            continue
+    async def run_async() -> None:
+        nonlocal attempts, successes, fallback_successes, timeouts, json_fails, other_errors, api_wall_total, api_cpu_total
+        sem = asyncio.Semaphore(3)
+        timeout_cfg = aiohttp.ClientTimeout(total=VISION_TIMEOUT)
 
-        for model in [primary, fallback]:
-            attempts += 1
-            try:
-                # Model-aware prompts: llava returns JSON, llama3.2-vision returns text
-                if "llava" in model:
-                    prompt = (
-                        f'Analyze this photo. Blur={p.blur:.0f}, '
-                        f'brisque={p.brisque:.0f}, composite={p.composite_score:.0f}. '
-                        f'Input is a foveated composite: LEFT=full-scene thumbnail (composition context), '
-                        f'RIGHT TOP=300x300 center-detail tile at native resolution, '
-                        f'RIGHT BOTTOM=300x300 primary-face detail tile when present. '
-                        f'Judge focus and noise primarily from the RIGHT detail tile(s); use LEFT for composition context. '
-                        f'Reply ONLY with JSON, no fences: '
-                        f'{{"caption":"one sentence",'
-                        f'"category":"people/landscape/food/document/animal/architecture/event/other",'
-                        f'"quality":"excellent/good/average/poor",'
-                        f'"memorability":N,'
-                        f'"keep_reason":"...",'
-                        f'"delete_reason":"..."}}\n'
-                        f'memorability: 1=mundane/generic (parking lot, blank wall, accidental shot), '
-                        f'2=ordinary (common scene, nothing special), '
-                        f'3=decent (nice moment, worth reviewing), '
-                        f'4=memorable (special moment, great composition, emotional value), '
-                        f'5=exceptional (once-in-a-lifetime, stunning, deeply personal). '
-                        f'A blurry photo of a meaningful moment scores higher than a sharp photo of nothing.'
-                    )
-                else:
-                    # llama3.2-vision ignores JSON instructions, use structured text
-                    prompt = (
-                        "Input is a foveated composite: LEFT=full-scene thumbnail, RIGHT TOP=center 300x300 detail tile, "
-                        "RIGHT BOTTOM=primary-face 300x300 detail tile when present.\n"
-                        "Judge focus and noise primarily from RIGHT detail tile(s); use LEFT for composition context.\n"
-                        "Describe this photo in one sentence.\n"
-                        "Then on separate lines write:\n"
-                        "QUALITY: excellent/good/average/poor\n"
-                        "CATEGORY: people/landscape/food/document/animal/architecture/event/other\n"
-                        "MEMORABILITY: 1-5 (1=mundane generic shot, 3=decent moment, 5=exceptional/once-in-a-lifetime)\n"
-                        "A blurry photo of a meaningful moment scores higher than a sharp photo of nothing."
-                    )
+        async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
+            async def process_one(p: Photo) -> None:
+                nonlocal attempts, successes, fallback_successes, timeouts, json_fails, other_errors, api_wall_total, api_cpu_total
+                check_gpu_headroom(perf_log=perf_log)
+                encode_tick = perf_counter()
+                b64 = to_b64(Path(p.path), max_size=(512, 512), face_bbox=p.primary_face_bbox)
+                encode_secs = perf_counter() - encode_tick
+                if not b64:
+                    return
 
-                api_wall_tick = perf_counter()
-                api_cpu_tick = process_time()
-                pre_bus = None
-                mon = GPUMonitor("STAGE_7", enabled=perf_log)
-                mon.__enter__()
-                pre_bus = mon._snapshot()
-                resp = requests.post(OLLAMA_URL, json={
-                    "model": model, "prompt": prompt,
-                    "images": [b64], "stream": False,
-                    "options": {"temperature": 0.1, "num_predict": 300}
-                }, timeout=VISION_TIMEOUT)
-                resp.raise_for_status()
-                api_wall_total += perf_counter() - api_wall_tick
-                api_cpu_total += process_time() - api_cpu_tick
-                resp_json = resp.json()
-                raw = resp_json.get("response", "").strip()
-                post_bus = mon._snapshot()
-                mon.__exit__(None, None, None)
-
-                if "llava" in model:
-                    data = parse_json(raw)
-                    p.caption            = data.get("caption", "")
-                    p.vision_category    = data.get("category", "")
-                    p.vision_quality     = data.get("quality", "")
-                    p.vision_keep        = data.get("keep_reason", "")
-                    p.vision_delete      = data.get("delete_reason", "")
-                    memo = data.get("memorability", 0)
-                    try:
-                        p.vision_memorability = max(1, min(5, int(memo)))
-                    except (ValueError, TypeError):
-                        p.vision_memorability = 0
-                else:
-                    # Regex parser for llama3.2-vision structured text output
-                    qm = re.search(r'QUALITY:\s*(excellent|good|average|poor)', raw, re.I)
-                    cm = re.search(r'CATEGORY:\s*(\w+)', raw, re.I)
-                    mm = re.search(r'MEMORABILITY:\s*(\d)', raw, re.I)
-                    sentences = [s.strip() for s in raw.replace('\n', ' ').split('.')
-                                 if len(s.strip()) > 20]
-                    p.caption            = sentences[0] if sentences else ""
-                    p.vision_quality     = qm.group(1).lower() if qm else "average"
-                    p.vision_category    = cm.group(1).lower() if cm else "other"
-                    if mm:
+                async with sem:
+                    for model in [primary, fallback]:
+                        attempts += 1
                         try:
-                            p.vision_memorability = max(1, min(5, int(mm.group(1))))
-                        except (ValueError, TypeError):
-                            p.vision_memorability = 0
+                            prompt = (
+                                f"Blur={p.blur:.0f} brisque={p.brisque:.0f} composite={p.composite_score:.0f}. "
+                                "Foveated image: LEFT scene context; RIGHT detail tiles for focus/noise. "
+                                "Technical Audit Only. No conversational preamble. Output JSON and stop immediately. "
+                                '{"caption":"one sentence","category":"people/landscape/food/document/animal/architecture/event/other",'
+                                '"quality":"excellent/good/average/poor","memorability":1,"keep_reason":"...","delete_reason":"..."}'
+                            )
+                            api_wall_tick = perf_counter()
+                            api_cpu_tick = process_time()
+                            mon = GPUMonitor("STAGE_7", enabled=perf_log)
+                            mon.__enter__()
+                            pre_bus = mon._snapshot()
+                            async with session.post(OLLAMA_URL, json={
+                                "model": model, "prompt": prompt,
+                                "images": [b64], "stream": False,
+                                "options": {"temperature": 0.1, "num_predict": 220}
+                            }) as resp:
+                                resp.raise_for_status()
+                                resp_json = await resp.json()
+                            api_wall_total += perf_counter() - api_wall_tick
+                            api_cpu_total += process_time() - api_cpu_tick
+                            raw = resp_json.get("response", "").strip()
+                            post_bus = mon._snapshot()
+                            mon.__exit__(None, None, None)
 
-                if perf_log:
-                    b64_mb = len(b64.encode("utf-8")) / (1024 * 1024)
-                    tx0 = (pre_bus or {}).get("pcie_tx_kbs", 0.0) / 1024.0
-                    tx1 = (post_bus or {}).get("pcie_tx_kbs", 0.0) / 1024.0
-                    bus_tx = max(tx0, tx1)
-                    vram_gb = ((post_bus or {}).get("vram_used", 0.0)) / (1024 ** 3)
-                    td = resp_json.get("total_duration", 0) / 1e6
-                    ld = resp_json.get("load_duration", 0) / 1e6
-                    ped = resp_json.get("prompt_eval_duration", 0) / 1e6
-                    ed = resp_json.get("eval_duration", 0) / 1e6
-                    log.info(
-                        f"[PERF] [STAGE_7] File: {Path(p.path).name} | Bus_TX: {bus_tx:.1f}MB/s | "
-                        f"Base64_Size: {b64_mb:.2f}MB | Encode_Ship: {encode_secs*1000:.1f}ms | "
-                        f"VRAM_Used: {vram_gb:.2f}GB | Ollama_Total: {td:.1f}ms | "
-                        f"Ollama_Load: {ld:.1f}ms | Ollama_Prompt: {ped:.1f}ms | Ollama_Eval: {ed:.1f}ms"
-                    )
-                p.vision_model = model
-                db.save(p)
-                successes += 1
-                if model != primary:
-                    fallback_successes += 1
-                break  # success, skip fallback
+                            data = parse_json(raw)
+                            p.caption = data.get("caption", "")
+                            p.vision_category = data.get("category", "")
+                            p.vision_quality = data.get("quality", "")
+                            p.vision_keep = data.get("keep_reason", "")
+                            p.vision_delete = data.get("delete_reason", "")
+                            memo = data.get("memorability", 0)
+                            try:
+                                p.vision_memorability = max(1, min(5, int(memo)))
+                            except (ValueError, TypeError):
+                                p.vision_memorability = 0
 
-            except (ValueError, json.JSONDecodeError) as e:
-                log.warning(f"Vision JSON fail {Path(p.path).name} ({model}): {e}")
-                p.error = f"vision_json:{model}"
-                json_fails += 1
-            except requests.exceptions.Timeout:
-                log.warning(f"Vision timeout {Path(p.path).name} ({model})")
-                p.error = f"vision_timeout:{model}"
-                timeouts += 1
-            except Exception as e:
-                log.warning(f"Vision error {Path(p.path).name} ({model}): {type(e).__name__}")
-                p.error = f"vision_err:{model}"
-                other_errors += 1
+                            if perf_log:
+                                b64_mb = len(b64.encode("utf-8")) / (1024 * 1024)
+                                tx0 = (pre_bus or {}).get("pcie_tx_kbs", 0.0) / 1024.0
+                                tx1 = (post_bus or {}).get("pcie_tx_kbs", 0.0) / 1024.0
+                                bus_tx = max(tx0, tx1)
+                                vram_gb = ((post_bus or {}).get("vram_used", 0.0)) / (1024 ** 3)
+                                td = resp_json.get("total_duration", 0) / 1e6
+                                ld = resp_json.get("load_duration", 0) / 1e6
+                                ped = resp_json.get("prompt_eval_duration", 0) / 1e6
+                                ed = resp_json.get("eval_duration", 0) / 1e6
+                                log.info(
+                                    f"[PERF] [STAGE_7] File: {Path(p.path).name} | Bus_TX: {bus_tx:.1f}MB/s | "
+                                    f"Base64_Size: {b64_mb:.2f}MB | Encode_Ship: {encode_secs*1000:.1f}ms | "
+                                    f"VRAM_Used: {vram_gb:.2f}GB | Ollama_Total: {td:.1f}ms | "
+                                    f"Ollama_Load: {ld:.1f}ms | Ollama_Prompt: {ped:.1f}ms | Ollama_Eval: {ed:.1f}ms"
+                                )
+                            p.vision_model = model
+                            db.save(p)
+                            successes += 1
+                            if model != primary:
+                                fallback_successes += 1
+                            return
+                        except (ValueError, json.JSONDecodeError) as e:
+                            log.warning(f"Vision JSON fail {Path(p.path).name} ({model}): {e}")
+                            p.error = f"vision_json:{model}"
+                            json_fails += 1
+                        except asyncio.TimeoutError:
+                            log.warning(f"Vision timeout {Path(p.path).name} ({model})")
+                            p.error = f"vision_timeout:{model}"
+                            timeouts += 1
+                        except Exception as e:
+                            log.warning(f"Vision error {Path(p.path).name} ({model}): {type(e).__name__}")
+                            p.error = f"vision_err:{model}"
+                            other_errors += 1
 
-    # Re-score with vision data incorporated
+            tasks = [asyncio.create_task(process_one(p)) for p in candidates]
+            for fut in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="S7 vision"):
+                await fut
+
+    asyncio.run(run_async())
+
     photos = compute_scores(photos)
     processed = sum(1 for p in photos if p.vision_model)
+    elapsed_minutes = max(api_wall_total / 60.0, 1e-9)
+    concurrent_throughput = successes / elapsed_minutes
     avg_wall = (api_wall_total / successes) if successes else 0.0
     avg_cpu = (api_cpu_total / successes) if successes else 0.0
     log.info(
@@ -1573,7 +1546,8 @@ def stage_vision(photos: List[Photo], db: DB,
         f"{processed} processed | attempts={attempts} success={successes} "
         f"fallback_success={fallback_successes} timeout={timeouts} "
         f"json_fail={json_fails} error={other_errors} "
-        f"| vision_avg_wall={avg_wall:.2f}s vision_avg_cpu={avg_cpu:.2f}s"
+        f"| vision_avg_wall={avg_wall:.2f}s vision_avg_cpu={avg_cpu:.2f}s "
+        f"Concurrent_Throughput={concurrent_throughput:.2f} img/min"
     )
     return photos
 
@@ -1905,6 +1879,11 @@ def main():
     args = parser.parse_args()
     config = _read_config(args.config)
     args = _apply_config_defaults(args, config)
+
+    if args.enable_vision:
+        num_parallel = int(os.environ.get("OLLAMA_NUM_PARALLEL", "0") or "0")
+        if num_parallel < 4:
+            raise RuntimeError("OLLAMA_NUM_PARALLEL must be set to at least 4 for concurrent vision inference.")
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
