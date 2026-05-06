@@ -1096,8 +1096,32 @@ def thermal_guard(perf_log: bool = False, threshold_c: float = 75.0, cooldown_se
         log.warning(f"[PERF] [THERMAL_GUARD] Temperature check failed: {type(e).__name__}")
 
 
+
+
+def _clip_stack_healthy() -> tuple[bool, str]:
+    """Return (healthy, details) for torch/torchvision runtime needed by CLIP stack."""
+    try:
+        import torch
+        import torchvision
+        from torchvision.ops import nms as _nms
+
+        _ = _nms
+        return True, f"torch={torch.__version__}, torchvision={torchvision.__version__}"
+    except Exception as e:
+        return False, str(e)
+
+
 # ── Stage 4: CLIP tagging ─────────────────────────────────────────────────────
 def stage_clip(photos: List[Photo], db: DB, perf_log: bool = False) -> List[Photo]:
+    healthy, health_details = _clip_stack_healthy()
+    if not healthy:
+        log.warning(
+            "S4 CLIP      : skipped (%s). This commonly indicates incompatible torch/torchvision builds; "
+            "install matching versions to re-enable CLIP tagging.",
+            health_details,
+        )
+        return photos
+
     try:
         import openvino as ov
         from optimum.intel.openvino import OVModelForZeroShotImageClassification
