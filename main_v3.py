@@ -1783,6 +1783,38 @@ def write_csv(photos: List[Photo], path: str):
     log.info(f"CSV          : {len(rows)} rows")
 
 
+def copy_photos_by_decision(photos: List[Photo], source_root: str, output_dir: str):
+    decision_dirs = {
+        "REMOVE": Path(output_dir) / "REMOVE",
+        "REVIEW": Path(output_dir) / "REVIEW",
+        "KEEP": Path(output_dir) / "KEEP",
+    }
+    for target_dir in decision_dirs.values():
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+    src_root = Path(source_root).resolve()
+    copied = Counter()
+
+    for p in photos:
+        if not p.file_exists or p.decision not in decision_dirs:
+            continue
+        src = Path(p.path)
+        if not src.exists():
+            continue
+        try:
+            rel = src.resolve().relative_to(src_root)
+            dest = decision_dirs[p.decision] / rel
+        except Exception:
+            dest = decision_dirs[p.decision] / p.filename
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        copied[p.decision] += 1
+
+    log.info(
+        f"Decision copy: KEEP={copied['KEEP']} REMOVE={copied['REMOVE']} REVIEW={copied['REVIEW']}"
+    )
+
+
 def write_metrics_excel(photos: List[Photo], path: str, folder: str):
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -2110,6 +2142,8 @@ def main():
                 write_excel(photos, str(out_dir / "photo_cleanup.xlsx"))
             with stage_timer("Write CSV"):
                 write_csv(photos, str(out_dir / "photo_cleanup.csv"))
+            with stage_timer("Copy photos by decision"):
+                copy_photos_by_decision(photos, args.folder, str(out_dir))
 
         wall_secs = (datetime.now() - start).total_seconds()
         cpu_secs = process_time() - start_cpu
