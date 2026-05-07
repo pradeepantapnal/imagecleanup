@@ -248,6 +248,7 @@ class Photo:
     score: int = -1
     decision: str = ""
     reason: str = ""
+    audit_mode: str = "Deterministic"
     # Meta
     cache_key: str = ""
     error: str = ""
@@ -1135,9 +1136,10 @@ def stage_clip(photos: List[Photo], db: DB, perf_log: bool = False) -> List[Phot
 
     model = None
     try:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        if device != "cuda":
-            log.warning("S4 CLIP      : CUDA unavailable; falling back to CPU")
+        if not torch.cuda.is_available():
+            log.warning("S4 CLIP      : CUDA unavailable; skipping CLIP stage")
+            return photos
+        device = "cuda"
 
         try:
             model, preprocess = clip.load("ViT-B/32", device=device)
@@ -1513,10 +1515,21 @@ def compute_scores(photos: List[Photo]) -> List[Photo]:
 
 # ── Stage 7: Vision LLM (selective, score band 35-65) ─────────────────────────
 def stage_vision(photos: List[Photo], db: DB,
-                 primary: str, fallback: str, limit: int, perf_log: bool = False) -> List[Photo]:
-    candidates = [p for p in photos
-                  if p.file_exists and not p.vision_model
-                  and VISION_BAND_LOW <= p.score <= VISION_BAND_HIGH][:limit]
+                 primary: str, fallback: str, limit: int, perf_log: bool = False,
+                 candidates: Optional[List[Photo]] = None) -> List[Photo]:
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            log.warning("S7 vision    : CUDA unavailable; skipping vision stage")
+            return photos
+    except Exception:
+        log.warning("S7 vision    : torch unavailable; skipping vision stage")
+        return photos
+
+    if candidates is None:
+        candidates = [p for p in photos
+                      if p.file_exists and not p.vision_model
+                      and VISION_BAND_LOW <= p.score <= VISION_BAND_HIGH][:limit]
 
     if not candidates:
         log.info("S7 vision    : no candidates in review band")
@@ -1634,6 +1647,9 @@ def stage_vision(photos: List[Photo], db: DB,
                 await fut
 
     asyncio.run(run_async())
+    for p in candidates:
+        if p.vision_model:
+            p.audit_mode = "VLM_Full"
 
     photos = compute_scores(photos)
     processed = sum(1 for p in photos if p.vision_model)
@@ -1658,6 +1674,7 @@ def write_excel(photos: List[Photo], path: str):
         ("filename",        "Filename",   28, "left"),
         ("score",           "Score /100",  10, "center"),
         ("decision",        "Decision",   12, "center"),
+        ("audit_mode",      "Audit_Mode", 14, "center"),
         ("vision_category", "Category",   14, "center"),
         ("caption",         "Caption",    50, "left"),
         ("reason",          "Reason",     35, "left"),
@@ -1758,9 +1775,9 @@ def write_csv(photos: List[Photo], path: str):
     )
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["filename", "score", "decision", "category", "caption", "reason", "path"])
+        w.writerow(["filename", "score", "decision", "audit_mode", "category", "caption", "reason", "path"])
         for p in rows:
-            w.writerow([p.filename, p.score, p.decision,
+            w.writerow([p.filename, p.score, p.decision, p.audit_mode,
                         p.vision_category or p.clip_tags,
                         p.caption, p.reason, p.path])
     log.info(f"CSV          : {len(rows)} rows")
@@ -1958,6 +1975,8 @@ def main():
                         help="Process only N images (default: from config or all)")
     parser.add_argument("--enable-vision", action="store_true", default=None,
                         help="Use Ollama vision LLM on ambiguous photos")
+    parser.add_argument("--force-vision", action="store_true", default=False,
+                        help="If True, bypasses deterministic scoring thresholds and sends 100% of the dataset to the VLM for auditing.")
     parser.add_argument("--enable-faces", action="store_true", default=None,
                         help="Enable face detection and clustering")
     parser.add_argument("--vision-model", default=None,
@@ -2069,9 +2088,17 @@ def main():
         if args.enable_vision:
             thermal_guard(perf_log=args.perf_log)
             with stage_timer("S7 vision analysis"):
+                if args.force_vision:
+                    vision_queue = [p for p in photos if p.file_exists and not p.vision_model]
+                    log.info(f"[INFO] FORCE_VISION ACTIVE: Queuing {len(vision_queue)} images for full VLM audit.")
+                else:
+                    vision_queue = [p for p in photos
+                                    if p.file_exists and not p.vision_model
+                                    and VISION_BAND_LOW <= p.score <= VISION_BAND_HIGH][:args.vision_limit]
                 photos = stage_vision(photos, db,
                                       args.vision_model, args.vision_fallback,
-                                      args.vision_limit, perf_log=args.perf_log)
+                                      args.vision_limit, perf_log=args.perf_log,
+                                      candidates=vision_queue)
 
         if args.dry_run:
             with stage_timer("Dry-run summary"):
